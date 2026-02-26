@@ -14,13 +14,13 @@ if __name__ == "__main__":
     #trajectory_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household/groundtruth.txt"
     
     data_path = "./Datasets/Replica/habitat_capture"
-    trajectory_path = "./Datasets/Replica/habitat_capture/trajectory_twc_opencv.txt"
+    trajectory_path = "./Datasets/Replica/habitat_capture/trajectory_twc_eye.txt"
     
     data = TUMDataLoader(os.path.join(data_path, "rgb"), os.path.join(data_path, "depth"),trajectory_path, stream=True)
     #config = Config()
     config = ReplicaConfig()
     print("Loading Data...")
-    data.load_data(100)
+    data.load_data(1000)
     print("Data Loaded.")
 
     # Initialize Tracker
