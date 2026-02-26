@@ -19,7 +19,7 @@ class SimpleORBTracker(Tracker):
         self.orb = cv2.ORB_create(nfeatures=Orb_features)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        self.poses = [dataset.gt_poses[0 +2]]
+        self.poses = [dataset.gt_poses[0 ]]
         #keyframes
         # keyframe thresholds
         self.alpha = config.get("kf_translation", 0.05)
@@ -149,7 +149,7 @@ class SimpleORBTracker(Tracker):
 
         pose = self.poses[-1] @ np.linalg.inv(T)   
         if(len(self.poses)+2 <len(self.dataset.gt_poses)):
-            pose = self.dataset.gt_poses[len(self.poses )+2]
+            pose = self.dataset.gt_poses[len(self.poses )]
         else:
             return
         self.poses.append(pose)  
