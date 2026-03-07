@@ -1,4 +1,3 @@
-
 import threading
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GUI.WindowManager import WindowManager
@@ -10,7 +9,7 @@ import cv2
 import numpy as np
 
 class RTSGSSystem:
-    def __init__(self, dataset:DataLoader, tracker:Tracker,config):
+    def __init__(self, dataset: DataLoader, tracker: Tracker, config):
         self.dataset = dataset
         self.tracker = tracker
 
@@ -21,43 +20,49 @@ class RTSGSSystem:
         self._cv = threading.Condition()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
 
-        # Define the point cloud
+        # Define the point cloud and GS engine
         self.pcd = PointCloud(config)
-        self.gs = GaussianSplatting(self.pcd,self.dataset,self.tracker)
-        self.window = WindowManager(self.pcd,self.gs,1280, 720, "RTSGS System")
+        self.gs = GaussianSplatting(self.pcd, self.dataset, self.tracker)
+        self.window = WindowManager(self.pcd, self.gs, 1280, 720, "RTSGS System")
 
-        #we combine each Frame point cloud tensor each n frames to save performance
-        self.update_point_cloud_each = 1
-        self.last_updated_key_frame = 0
-        self.final_update = False
-        
+        # Track the last keyframe index added to the map
+        self.last_added_keyframe_idx = -1
 
     def run(self):
-
         self._worker.start()
 
         while not self.window.window_should_close():
             self.window.start_frame()
 
+            # 1. Process streaming data and track
             frame = self.process_stream_frame()
-            self.gs.training_step()
-            #main thread
-            start = self.dataset.current_keyframe_index - self.update_point_cloud_each
-            end = self.dataset.current_keyframe_index
-            #we update the pcd each n frames 
-            if(self.dataset.current_keyframe_index % self.update_point_cloud_each == 0 and frame is not None and self.last_updated_key_frame != self.dataset.current_keyframe_index ):
-                print("update")
-                self.last_updated_key_frame = self.dataset.current_keyframe_index
-                self.pcd.update_full_pointcloud(self.dataset.rgb_keyframes[start:end],self.dataset.depth_keyframes[start:end],self.tracker.keyframes_poses[start:end])
             
-            #special case
-            if(self.dataset.current_keyframe_index== len(self.dataset.rgb_keyframes) and self.final_update == False):
-                self.final_update = True
-                self.last_updated_key_frame = self.dataset.current_keyframe_index
-                self.pcd.update_full_pointcloud(self.dataset.rgb_keyframes[start:end],self.dataset.depth_keyframes[start:end],self.tracker.keyframes_poses[start:end])
+            # 2. Run a training step (Optimization)
+            # This is now throttled internally by your max_steps_per_sec logic
+            self.gs.training_step()
+
+            # 3. Asynchronous Map Update
+            # Check if the tracker has produced a new keyframe that we haven't processed yet
+            current_idx = self.dataset.current_keyframe_index - 1
+            
+            if current_idx >= 0 and current_idx != self.last_added_keyframe_idx:
+                # Attempt to update the point cloud asynchronously
+                # update_async returns False if the background thread is still busy
+                success = self.pcd.update_async(
+                    self.dataset.rgb_keyframes[current_idx],
+                    self.dataset.depth_keyframes[current_idx],
+                    self.tracker.keyframes_poses[current_idx]
+                )
+                
+                if success:
+                    print(f"Update triggered for keyframe: {current_idx}")
+                    self.last_added_keyframe_idx = current_idx
+
+            # 4. Visualization and GUI
             self.tracker.visualize_tracking()
             self.window.render_frame()
 
+        # Shutdown sequence
         with self._cv:
             self._stop = True
             self._cv.notify_all()
@@ -74,18 +79,16 @@ class RTSGSSystem:
         frame_paths = self.dataset.get_next_frame()
         if frame_paths is None:
             return None
-        print(len(self.dataset.rgb_keyframes))
-        #read color and depth img
+        
+        # Read color and depth img
         rgb = cv2.imread(frame_paths[0], cv2.IMREAD_COLOR)
         depth = cv2.imread(frame_paths[1], cv2.IMREAD_UNCHANGED).astype(np.float32)
-        frame = (rgb,depth)
         
-        img, depth = frame[0], frame[1]
         with self._cv:
-            self._pending = (img, depth)
+            self._pending = (rgb, depth)
             self._busy = True
             self._cv.notify()
-        return frame
+        return (rgb, depth)
 
     def _worker_loop(self):
         while True:
@@ -100,6 +103,8 @@ class RTSGSSystem:
                 self._pending = None
 
             try:
+                # The tracker updates dataset.current_keyframe_index internally 
+                # when a new keyframe is detected.
                 self.tracker.track_frame(img, depth)
             finally:
                 with self._cv:

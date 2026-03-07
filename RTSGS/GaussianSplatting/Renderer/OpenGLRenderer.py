@@ -75,29 +75,29 @@ class Renderer:
         self.update_vbo(self.pcd.all_points, self.pcd.all_sh)
 
     def update_vbo(self, positions, sh_coeffs):
+        # The arguments 'positions' and 'sh_coeffs' passed from render_pcd
+        # are already detached/referenced under the lock there.
         if positions is None or positions.numel() == 0:
             return
 
-        # UPDATED: Extract raw 0th order SH coefficients [N, 0, 3]
-        # We send raw coefficients; conversion to RGB (sh*0.282 + 0.5) happens in shader
+        # Convert to numpy under the assumption these are consistent snapshots
+        # We take the 0th order SH (index 0) and the XYZ positions
         sh0_data = sh_coeffs[:, 0, :].detach().cpu().numpy().astype(np.float32)
         positions_data = positions.detach().cpu().numpy().astype(np.float32)
         
+        # This will now succeed because they were grabbed under the lock together
         interleaved = np.hstack([positions_data, sh0_data])
         required_bytes = interleaved.nbytes
 
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
-
-        # Reallocate if needed
         if required_bytes > self.vbo_capacity_bytes:
             self.vbo_capacity_bytes = required_bytes
-            glBufferData(GL_ARRAY_BUFFER, self.vbo_capacity_bytes, None, GL_DYNAMIC_DRAW)
-
-        glBufferSubData(GL_ARRAY_BUFFER, 0, required_bytes, interleaved)
+            glBufferData(GL_ARRAY_BUFFER, self.vbo_capacity_bytes, interleaved, GL_DYNAMIC_DRAW)
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, required_bytes, interleaved)
+        
         glBindBuffer(GL_ARRAY_BUFFER, 0)
-
-        # update added points counts
-        self.pcd_added_size = self.pcd.all_points.shape[0]
+        self.pcd_added_size = positions.shape[0]
 
     def Render(self):
         self.fb.bind()
@@ -108,18 +108,26 @@ class Renderer:
         self.fb.unbind()
 
     def render_pcd(self):
-        # Initialize if needed
-        self._initialize_pcd_rendering()
-        if not self._initialized:
-            return
+        # 1. Thread-safe check and data extraction
+        with self.pcd.lock:
+            # Skip if data isn't ready
+            if self.pcd.all_points is None or self.pcd.all_sh is None:
+                return
 
-        # UPDATED: Check against all_sh presence and count
-        if self.pcd_added_size < self.pcd.all_points.shape[0]:
-            self.update_vbo(self.pcd.all_points, self.pcd.all_sh)
-        
+            current_count = self.pcd.all_points.shape[0]
+            
+            # 2. Check if we need to update the OpenGL buffers
+            # Only run the heavy upload if the point count changed
+            if not self._initialized:
+                self._initialize_pcd_rendering()
+            elif self.pcd_added_size != current_count:
+                # We pass the tensors directly while inside the lock
+                self.update_vbo(self.pcd.all_points, self.pcd.all_sh)
+
+        # 3. Standard OpenGL Drawing (Outside the lock to keep it fast)
+        res.simple_shader.use()
         self.camera.update_view()
         
-        # update uniforms
         glUniformMatrix4fv(
             glGetUniformLocation(res.simple_shader.program, 'u_view'),
             1, GL_FALSE, self.camera.view           
@@ -130,7 +138,7 @@ class Renderer:
         )
 
         glBindVertexArray(self.vao)
-        glDrawArrays(GL_POINTS, 0, int(self.pcd.all_points.shape[0]))
+        glDrawArrays(GL_POINTS, 0, self.pcd_added_size)
         glBindVertexArray(0)
 
     def cleanup(self):

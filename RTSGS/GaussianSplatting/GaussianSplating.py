@@ -3,7 +3,7 @@ import torch.nn.functional as F
 from gsplat import rendering, spherical_harmonics
 import numpy as np
 from pytorch_msssim import ssim
-import time  # Necessary for rate limiting
+import time
 
 class GaussianSplatting:
     def __init__(self, pcd, dataset, tracker, learning_rate=4e-3, max_steps_per_sec=1, downsample_factor=1.0):
@@ -36,23 +36,28 @@ class GaussianSplatting:
         self.vis_counts = None
 
     def _setup_optimizer(self):
+        """Initializes parameters and gradient buffers based on the current point cloud size."""
         if self.pcd.all_points is None: return
 
-        attrs = ["all_sh", "all_scales", "all_quaternions", "all_alpha"]
+        # Enable gradients for all relevant attributes
+        attrs = [ "all_sh", "all_scales", "all_quaternions", "all_alpha"]
         for attr in attrs:
             val = getattr(self.pcd, attr)
             if not isinstance(val, torch.nn.Parameter):
+                # Convert to Parameter to allow optimization and .backward()
                 setattr(self.pcd, attr, torch.nn.Parameter(val.detach().requires_grad_(True)))
 
         params = [
+            #{'params': [self.pcd.all_points], 'lr': self.base_lr, "name": "points"},
             {'params': [self.pcd.all_sh], 'lr': self.base_lr * 3.0, "name": "sh"},
             {'params': [self.pcd.all_scales], 'lr': self.base_lr * 3.0, "name": "scales"},
             {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 1, "name": "quats"},
             {'params': [self.pcd.all_alpha], 'lr': self.base_lr, "name": "alphas"},
         ]
         self.optimizer = torch.optim.Adam(params)
+        
+        # Sync the internal count and reset gradient buffers to match the current point count
         self.num_points_optimized = self.pcd.all_points.shape[0]
-
         self.xys_grad_norm = torch.zeros(self.num_points_optimized, device=self.device)
         self.vis_counts = torch.zeros(self.num_points_optimized, device=self.device)
 
@@ -91,85 +96,90 @@ class GaussianSplatting:
         if current_time - self.last_step_time < self.min_interval:
             return 0.0
 
-        if self.pcd.all_points is None or not self.tracker.keyframes_poses:
-            return 0.0
+        # LOCK: Ensure background threads don't modify the point cloud during the backward pass
+        with self.pcd.lock:
+            if self.pcd.all_points is None or not self.tracker.keyframes_poses:
+                return 0.0
 
-        self.iteration_count += 1
-        self.last_step_time = current_time # Update timestamp
-        
-        if self.optimizer is None or self.pcd.all_points.shape[0] != self.num_points_optimized:
-            self._setup_optimizer()
+            self.iteration_count += 1
+            self.last_step_time = current_time 
+            
+            # Re-initialize if the point cloud grew via the background thread
+            if self.optimizer is None or self.pcd.all_points.shape[0] != self.num_points_optimized:
+                self._setup_optimizer()
 
-        self.optimizer.zero_grad()
-        
-        sample_idx = np.random.choice(len(self.tracker.keyframes_poses), min(2, len(self.tracker.keyframes_poses)), replace=False)
-        
-        # --- Downsample Ground Truth ---
-        gt_rgbs_full = torch.stack([torch.from_numpy(self.dataset.rgb_keyframes[i]).to(self.device).float() / 255.0 for i in sample_idx])
-        # [B, H, W, 3] -> [B, 3, H, W] for interpolate
-        gt_rgbs = F.interpolate(gt_rgbs_full.permute(0, 3, 1, 2), size=(self.train_height, self.train_width), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
-        
-        T_fix = torch.eye(4, device=self.device)
-        T_fix[:3, :3] = self.pcd.R_fix
+            self.optimizer.zero_grad()
+            
+            # 1. Sample keyframes for training
+            sample_idx = np.random.choice(len(self.tracker.keyframes_poses), min(2, len(self.tracker.keyframes_poses)), replace=False)
+            
+            # 2. Prepare Ground Truth (with Downsampling)
+            gt_rgbs_full = torch.stack([torch.from_numpy(self.dataset.rgb_keyframes[i]).to(self.device).float() / 255.0 for i in sample_idx])
+            gt_rgbs = F.interpolate(gt_rgbs_full.permute(0, 3, 1, 2), size=(self.train_height, self.train_width), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
+            
+            # 3. Setup Camera Matrices
+            T_fix = torch.eye(4, device=self.device)
+            T_fix[:3, :3] = self.pcd.R_fix
+            viewmats = []
+            cam_centers = []
+            for i in sample_idx:
+                pose = torch.from_numpy(self.tracker.keyframes_poses[i]).to(self.device).float()
+                w2c = torch.inverse(T_fix @ pose)
+                viewmats.append(w2c)
+                cam_centers.append((T_fix @ pose)[:3, 3])
 
-        viewmats = []
-        cam_centers = []
-        for i in sample_idx:
-            pose = torch.from_numpy(self.tracker.keyframes_poses[i]).to(self.device).float()
-            w2c = torch.inverse(T_fix @ pose)
-            viewmats.append(w2c)
-            cam_centers.append((T_fix @ pose)[:3, 3])
+            viewmats = torch.stack(viewmats)
+            cam_centers = torch.stack(cam_centers)
 
-        viewmats = torch.stack(viewmats)
-        cam_centers = torch.stack(cam_centers)
+            K = torch.eye(3, device=self.device)
+            K[0,0], K[1,1] = self.pcd.fx / self.downsample_factor, self.pcd.fy / self.downsample_factor
+            K[0,2], K[1,2] = self.pcd.cx / self.downsample_factor, self.pcd.cy / self.downsample_factor
+            Ks = K.unsqueeze(0).expand(len(sample_idx), -1, -1)
 
-        # --- Scale Intrinsics for Downsampling ---
-        K = torch.eye(3, device=self.device)
-        K[0,0], K[1,1] = self.pcd.fx / self.downsample_factor, self.pcd.fy / self.downsample_factor
-        K[0,2], K[1,2] = self.pcd.cx / self.downsample_factor, self.pcd.cy / self.downsample_factor
-        Ks = K.unsqueeze(0).expand(len(sample_idx), -1, -1)
+            # 4. Spherical Harmonics Color Projection
+            means = self.pcd.all_points
+            dirs = means.unsqueeze(0) - cam_centers.unsqueeze(1)
+            dirs = F.normalize(dirs, dim=-1)
+            sh_coeffs = self.pcd.all_sh.unsqueeze(0).expand(len(sample_idx), -1, -1, -1)
+            colors_pre_activation = spherical_harmonics(self.pcd.sh_degree, dirs, sh_coeffs)
+            colors = torch.sigmoid(colors_pre_activation)
 
-        means = self.pcd.all_points
-        dirs = means.unsqueeze(0) - cam_centers.unsqueeze(1)
-        dirs = F.normalize(dirs, dim=-1)
+            # 5. Rasterization
+            rendered_rgb, _, info = rendering.rasterization(
+                means=self.pcd.all_points,
+                quats=F.normalize(self.pcd.all_quaternions, p=2, dim=-1),
+                scales=torch.exp(self.pcd.all_scales), 
+                opacities=torch.sigmoid(self.pcd.all_alpha).squeeze(-1),
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=self.train_width,
+                height=self.train_height,
+            )
 
-        sh_coeffs = self.pcd.all_sh.unsqueeze(0).expand(len(sample_idx), -1, -1, -1)
-        colors_pre_activation = spherical_harmonics(self.pcd.sh_degree, dirs, sh_coeffs)
-        colors = torch.sigmoid(colors_pre_activation)
+            # 6. Gradient & Loss Calculation
+            info["means2d"].retain_grad()
 
-        # --- Rasterize at Downsampled Resolution ---
-        rendered_rgb, _, info = rendering.rasterization(
-            means=self.pcd.all_points,
-            quats=F.normalize(self.pcd.all_quaternions, p=2, dim=-1),
-            scales=torch.exp(self.pcd.all_scales), 
-            opacities=torch.sigmoid(self.pcd.all_alpha).squeeze(-1),
-            colors=colors,
-            viewmats=viewmats,
-            Ks=Ks,
-            width=self.train_width,
-            height=self.train_height,
-        )
+            l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
+            ssim_val = ssim(rendered_rgb.permute(0, 3, 1, 2), gt_rgbs.permute(0, 3, 1, 2), data_range=1.0)
+            total_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)
+            
+            if total_loss > 0:
+                total_loss.backward()
 
-        info["means2d"].retain_grad()
+                with torch.no_grad():
+                    # Accumulate gradients for densification logic
+                    grads_2d = info["means2d"].grad
+                    v_norms = torch.norm(grads_2d[:, :2], dim=-1)
+                    gi_ids = info["gaussian_ids"].long() 
+                    
+                    self.xys_grad_norm.scatter_add_(0, gi_ids, v_norms)
+                    self.vis_counts.scatter_add_(0, gi_ids, torch.ones_like(v_norms))
 
-        l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
-        ssim_val = ssim(rendered_rgb.permute(0, 3, 1, 2), gt_rgbs.permute(0, 3, 1, 2), data_range=1.0)
-        total_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)
-        
-        if total_loss > 0:
-            total_loss.backward()
+                self.optimizer.step()
 
-            with torch.no_grad():
-                grads_2d = info["means2d"].grad
-                v_norms = torch.norm(grads_2d[:, :2], dim=-1)
-                gi_ids = info["gaussian_ids"].long() 
+            # 7. Densification Check
+            if self.iteration_count > self.densify_start_iter and self.iteration_count % self.densify_interval == 0:
+                self.densify()
                 
-                self.xys_grad_norm.scatter_add_(0, gi_ids, v_norms)
-                self.vis_counts.scatter_add_(0, gi_ids, torch.ones_like(v_norms))
-
-            self.optimizer.step()
-
-        if self.iteration_count > self.densify_start_iter and self.iteration_count % self.densify_interval == 0:
-            self.densify()
-                
-        return total_loss.item()
+            return total_loss.item()

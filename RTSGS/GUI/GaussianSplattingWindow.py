@@ -45,14 +45,19 @@ class GaussianSplattingWindow:
         self._xyz = self._sh = self._quats = self._scales = self._alpha = None
 
     def _pull_latest_buffers(self) -> bool:
-        # UPDATED: Pull all_sh instead of all_colors
-        xyz, sh = getattr(self.pcd, "all_points", None), getattr(self.pcd, "all_sh", None)
-        if xyz is None or xyz.numel() == 0: return False
-        
-        self._xyz, self._sh = xyz.detach(), sh.detach()
-        self._quats = getattr(self.pcd, "all_quaternions", None)
-        self._scales = getattr(self.pcd, "all_scales", None)
-        self._alpha = getattr(self.pcd, "all_alpha", None)
+        # Use the lock from the pcd object to ensure consistency
+        with self.pcd.lock:
+            xyz = getattr(self.pcd, "all_points", None)
+            if xyz is None or xyz.numel() == 0: 
+                return False
+            
+            # Detach and clone (or just reference) while under the lock
+            self._xyz = xyz.detach()
+            self._sh = getattr(self.pcd, "all_sh", None).detach()
+            self._quats = getattr(self.pcd, "all_quaternions", None).detach()
+            self._scales = getattr(self.pcd, "all_scales", None).detach()
+            self._alpha = getattr(self.pcd, "all_alpha", None).detach()
+            
         return True
 
     @torch.no_grad()
