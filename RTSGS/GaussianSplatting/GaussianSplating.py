@@ -1,11 +1,12 @@
 import torch
 import torch.nn.functional as F
-from gsplat import rendering,spherical_harmonics
+from gsplat import rendering, spherical_harmonics
 import numpy as np
 from pytorch_msssim import ssim
+import time  # Necessary for rate limiting
 
 class GaussianSplatting:
-    def __init__(self, pcd, dataset, tracker, learning_rate=1e-3):
+    def __init__(self, pcd, dataset, tracker, learning_rate=4e-3, max_steps_per_sec=1, downsample_factor=1.0):
         self.pcd = pcd
         self.dataset = dataset
         self.device = pcd.device
@@ -13,9 +14,19 @@ class GaussianSplatting:
         self.tracker = tracker
         self.width, self.height = tracker.config.get('width'), tracker.config.get('height')
         
+        # --- Downsampling Attributes ---
+        self.downsample_factor = downsample_factor
+        self.train_width = int(self.width / downsample_factor)
+        self.train_height = int(self.height / downsample_factor)
+        
         self.num_points_optimized = 0
         self.optimizer = None
         self.iteration_count = 0
+
+        # --- Rate Limiting ---
+        self.max_steps_per_sec = max_steps_per_sec
+        self.last_step_time = 0.0
+        self.min_interval = 1.0 / max_steps_per_sec if max_steps_per_sec > 0 else 0
 
         # --- Densification Hyperparameters ---
         self.densify_start_iter = 100
@@ -27,7 +38,6 @@ class GaussianSplatting:
     def _setup_optimizer(self):
         if self.pcd.all_points is None: return
 
-        # Updated attributes to include all_sh instead of all_colors
         attrs = ["all_sh", "all_scales", "all_quaternions", "all_alpha"]
         for attr in attrs:
             val = getattr(self.pcd, attr)
@@ -61,7 +71,6 @@ class GaussianSplatting:
 
         with torch.no_grad():
             new_points = self.pcd.all_points[mask].clone()
-            # New points inherit the SH coefficients
             new_sh = self.pcd.all_sh[mask].clone()
             new_quats = self.pcd.all_quaternions[mask].clone()
             
@@ -77,19 +86,28 @@ class GaussianSplatting:
         self._setup_optimizer()
 
     def training_step(self):
+        # --- Rate Limit Check ---
+        current_time = time.time()
+        if current_time - self.last_step_time < self.min_interval:
+            return 0.0
+
         if self.pcd.all_points is None or not self.tracker.keyframes_poses:
             return 0.0
 
         self.iteration_count += 1
+        self.last_step_time = current_time # Update timestamp
         
         if self.optimizer is None or self.pcd.all_points.shape[0] != self.num_points_optimized:
             self._setup_optimizer()
 
         self.optimizer.zero_grad()
         
-        # Setup Data
         sample_idx = np.random.choice(len(self.tracker.keyframes_poses), min(2, len(self.tracker.keyframes_poses)), replace=False)
-        gt_rgbs = torch.stack([torch.from_numpy(self.dataset.rgb_keyframes[i]).to(self.device).float() / 255.0 for i in sample_idx])
+        
+        # --- Downsample Ground Truth ---
+        gt_rgbs_full = torch.stack([torch.from_numpy(self.dataset.rgb_keyframes[i]).to(self.device).float() / 255.0 for i in sample_idx])
+        # [B, H, W, 3] -> [B, 3, H, W] for interpolate
+        gt_rgbs = F.interpolate(gt_rgbs_full.permute(0, 3, 1, 2), size=(self.train_height, self.train_width), mode='bilinear', align_corners=False).permute(0, 2, 3, 1)
         
         T_fix = torch.eye(4, device=self.device)
         T_fix[:3, :3] = self.pcd.R_fix
@@ -100,46 +118,40 @@ class GaussianSplatting:
             pose = torch.from_numpy(self.tracker.keyframes_poses[i]).to(self.device).float()
             w2c = torch.inverse(T_fix @ pose)
             viewmats.append(w2c)
-            # Camera center in world space is the translation of c2w
             cam_centers.append((T_fix @ pose)[:3, 3])
 
         viewmats = torch.stack(viewmats)
-        cam_centers = torch.stack(cam_centers) # [B, 3]
+        cam_centers = torch.stack(cam_centers)
 
+        # --- Scale Intrinsics for Downsampling ---
         K = torch.eye(3, device=self.device)
-        K[0,0], K[1,1], K[0,2], K[1,2] = self.pcd.fx, self.pcd.fy, self.pcd.cx, self.pcd.cy
+        K[0,0], K[1,1] = self.pcd.fx / self.downsample_factor, self.pcd.fy / self.downsample_factor
+        K[0,2], K[1,2] = self.pcd.cx / self.downsample_factor, self.pcd.cy / self.downsample_factor
         Ks = K.unsqueeze(0).expand(len(sample_idx), -1, -1)
 
-        # --- SH VIEW DIRECTION CALCULATION ---
-        # dir = (means - cam_center)
         means = self.pcd.all_points
-        # dirs shape: [Batch, N, 3]
         dirs = means.unsqueeze(0) - cam_centers.unsqueeze(1)
         dirs = F.normalize(dirs, dim=-1)
 
-        # Compute view-dependent colors using SH coefficients
-        # coeffs shape: [Batch, N, K, 3]
         sh_coeffs = self.pcd.all_sh.unsqueeze(0).expand(len(sample_idx), -1, -1, -1)
-        # Resulting colors are usually in linear space, we use sigmoid for final RGB
         colors_pre_activation = spherical_harmonics(self.pcd.sh_degree, dirs, sh_coeffs)
         colors = torch.sigmoid(colors_pre_activation)
 
-        # Rasterize
+        # --- Rasterize at Downsampled Resolution ---
         rendered_rgb, _, info = rendering.rasterization(
             means=self.pcd.all_points,
             quats=F.normalize(self.pcd.all_quaternions, p=2, dim=-1),
             scales=torch.exp(self.pcd.all_scales), 
             opacities=torch.sigmoid(self.pcd.all_alpha).squeeze(-1),
-            colors=colors, # Use SH-computed colors
+            colors=colors,
             viewmats=viewmats,
             Ks=Ks,
-            width=self.width,
-            height=self.height,
+            width=self.train_width,
+            height=self.train_height,
         )
 
         info["means2d"].retain_grad()
 
-        # Loss
         l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
         ssim_val = ssim(rendered_rgb.permute(0, 3, 1, 2), gt_rgbs.permute(0, 3, 1, 2), data_range=1.0)
         total_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)

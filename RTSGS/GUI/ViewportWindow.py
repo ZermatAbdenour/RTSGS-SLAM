@@ -26,7 +26,6 @@ class ViewportWindow:
         self.renderer.Render()
         avail = imgui.get_content_region_avail()
         target_w, target_h = max(self.min_w, int(avail.x)), max(self.min_h, int(avail.y))
-
         if target_w != int(self.fb.width) or target_h != int(self.fb.height):
             self.renderer.camera.update_resolution(target_w, target_h)
             self.fb.resize(target_w, target_h)
