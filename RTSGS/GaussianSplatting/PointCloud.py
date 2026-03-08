@@ -124,6 +124,52 @@ class PointCloud:
         H, W = depth.shape
         z_raw = depth.reshape(-1)
         mask = z_raw > 0
+
+        if self.all_points is not None and self.all_points.shape[0] > 0:
+            from gsplat import rendering
+            T_fix = torch.eye(4, device=self.device)
+            T_fix[:3, :3] = self.R_fix
+            w2c = torch.inverse(T_fix @ pose).unsqueeze(0)
+            
+            K = torch.eye(3, device=self.device)
+            K[0,0], K[1,1] = self.fx, self.fy
+            K[0,2], K[1,2] = self.cx, self.cy
+            Ks = K.unsqueeze(0)
+
+            dummy_colors = torch.ones((self.all_points.shape[0], 3), device=self.device)
+            
+            with torch.no_grad():
+                rendered_ed, render_alphas, _ = rendering.rasterization(
+                    means=self.all_points,
+                    quats=F.normalize(self.all_quaternions, p=2, dim=-1),
+                    scales=torch.exp(self.all_scales),
+                    opacities=torch.sigmoid(self.all_alpha).squeeze(-1),
+                    colors=dummy_colors,
+                    viewmats=w2c,
+                    Ks=Ks,
+                    width=W,
+                    height=H,
+                    render_mode="ED"
+                )
+
+            D_rend_flat = rendered_ed[0, ..., 0].reshape(-1)
+            O_flat = render_alphas[0, ..., 0].reshape(-1)
+            
+            tau = float(self.config.get("depth_tau", 0.05))
+            
+            hole_mask = (O_flat < 0.5) | (torch.abs(D_rend_flat - z_raw) > tau)
+            
+            valid_pixels = (z_raw > 0).sum().item()
+            if valid_pixels > 0:
+                unexplained_pixels = (hole_mask & (z_raw > 0)).sum().item()
+                explained_ratio = 1.0 - (unexplained_pixels / valid_pixels)
+                
+                if explained_ratio > 0.7:
+                    print(f"[Map] High overlap ({explained_ratio:.2f} > 0.70). Skipping spawn, refining existing.")
+                    return None
+            
+            mask &= hole_mask
+
         if self.pixel_subsample < 1.0:
             mask &= (torch.rand(z_raw.shape, device=self.device) < self.pixel_subsample)
         
@@ -141,10 +187,8 @@ class PointCloud:
         points_world = (R_corr @ points_cam.T).T + t_corr
         colors = rgb.reshape(-1, 3)[indices]
 
-        res = self.novelty_filter_fast_with_gaussians(points_world, colors, self.novelty_voxel)
-        if res is None: return None
-        
-        pts, cols, k_idx = res
+        pts, cols = points_world, colors
+        k_idx = torch.arange(pts.shape[0], device=self.device)
         
         # SH conversion
         sh_full = torch.zeros((pts.shape[0], self.num_sh_bases, 3), device=self.device)

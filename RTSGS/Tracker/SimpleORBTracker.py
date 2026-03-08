@@ -148,10 +148,10 @@ class SimpleORBTracker(Tracker):
         T[:3, 3] = tvec.reshape(3).astype(np.float32)
 
         pose = self.poses[-1] @ np.linalg.inv(T)   
-        if(len(self.poses)+2 <len(self.dataset.gt_poses)):
-            pose = self.dataset.gt_poses[len(self.poses )]
-        else:
-            return
+        # if(len(self.poses)+2 <len(self.dataset.gt_poses)):
+        #     pose = self.dataset.gt_poses[len(self.poses )]
+        # else:
+        #     return
         self.poses.append(pose)  
         #self.poses.append(pose.astype(np.float32))
 
