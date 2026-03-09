@@ -45,6 +45,7 @@ class PointCloud:
         self._pack_base = 2 * self._pack_offset + 1
         self.seen_keys = torch.empty((0,), dtype=torch.int64, device=self.device)
         self.pixel_subsample = float(config.get("pixel_subsample", 1.0))
+        self.unproject_stride = int(config.get("unproject_stride", 2))
 
         # Rotation Fix
         ax, ay = np.radians(-90), np.radians(180)
@@ -53,7 +54,7 @@ class PointCloud:
         self.R_fix = (Ry @ Rx).to(self.device).float()
 
         # --- Async Handling ---
-        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+        self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=2)
         self.is_processing = False
         self.lock = threading.Lock()
         
@@ -68,11 +69,13 @@ class PointCloud:
         sigma_x, sigma_y = (self.sigma_px / self.fx) * z, (self.sigma_px / self.fy) * z
         scales = torch.log(torch.clamp(torch.stack([sigma_x, sigma_y, sigma_z], dim=-1), min=0.01))
 
-        # Ensure R_world_from_cam is a batch of matrices even for a single pose
+        # Convert rotation(s) to quaternions efficiently
         if R_world_from_cam.dim() == 2:
-            R_world_from_cam = R_world_from_cam.unsqueeze(0).expand(N, -1, -1)
-
-        quats = torch.from_numpy(Rot.from_matrix(R_world_from_cam.cpu().numpy()).as_quat()).to(self.device).float()
+            # Single pose shared by all points — convert once and expand
+            single_quat = Rot.from_matrix(R_world_from_cam.cpu().numpy()).as_quat()
+            quats = torch.tensor(single_quat, device=self.device, dtype=torch.float32).unsqueeze(0).expand(N, -1)
+        else:
+            quats = torch.from_numpy(Rot.from_matrix(R_world_from_cam.cpu().numpy()).as_quat()).to(self.device).float()
 
         a = self.alpha_init * torch.exp(-z / self.alpha_depth_scale) if self.alpha_depth_scale > 0.0 else torch.full((N,), float(self.alpha_init), device=self.device)
         a = torch.logit(torch.clamp(a, self.alpha_min, self.alpha_max)).unsqueeze(1)
@@ -95,10 +98,13 @@ class PointCloud:
         return points[first_idx[is_new]], colors[first_idx[is_new]], first_idx[is_new]
 
     @torch.no_grad()
+    @torch.no_grad()
     def voxel_filter_with_gaussians(self, points, sh, scales, quats, alpha, voxel):
         if points.numel() == 0: return points, sh, scales, quats, alpha
         vox = torch.floor(points / voxel).to(torch.int64)
-        _, inverse = torch.unique(vox, dim=0, return_inverse=True)
+        # Use 1D packed keys instead of slow multi-dim torch.unique
+        keys = self._pack_voxels(vox)
+        _, inverse = torch.unique(keys, return_inverse=True)
         num = int(inverse.max().item()) + 1
         counts = torch.zeros((num, 1), device=self.device, dtype=points.dtype)
         counts.scatter_add_(0, inverse[:, None], torch.ones((points.shape[0], 1), device=self.device))
@@ -117,12 +123,23 @@ class PointCloud:
     @torch.no_grad()
     def process_single_keyframe(self, rgb_np, depth_np, pose_np):
         """Processes a single keyframe: Image + Depth + Pose -> Filtered Gaussians."""
-        rgb = torch.from_numpy(rgb_np).to(self.device).float() / 255.0
-        depth = torch.from_numpy(depth_np).to(self.device).float() / self.depth_scale
         pose = torch.from_numpy(pose_np).to(self.device).float()
 
-        H, W = depth.shape
-        z_raw = depth.reshape(-1)
+        # Stride-based downsampling before any heavy work
+        s = self.unproject_stride
+        if s > 1:
+            rgb_s = torch.from_numpy(rgb_np[::s, ::s]).to(self.device).float() / 255.0
+            depth_s = torch.from_numpy(depth_np[::s, ::s].copy()).to(self.device).float() / self.depth_scale
+            fx_s, fy_s = self.fx / s, self.fy / s
+            cx_s, cy_s = self.cx / s, self.cy / s
+        else:
+            rgb_s = torch.from_numpy(rgb_np).to(self.device).float() / 255.0
+            depth_s = torch.from_numpy(depth_np).to(self.device).float() / self.depth_scale
+            fx_s, fy_s = self.fx, self.fy
+            cx_s, cy_s = self.cx, self.cy
+
+        H, W = depth_s.shape
+        z_raw = depth_s.reshape(-1)
         mask = z_raw > 0
 
         if self.all_points is not None and self.all_points.shape[0] > 0:
@@ -132,8 +149,8 @@ class PointCloud:
             w2c = torch.inverse(T_fix @ pose).unsqueeze(0)
             
             K = torch.eye(3, device=self.device)
-            K[0,0], K[1,1] = self.fx, self.fy
-            K[0,2], K[1,2] = self.cx, self.cy
+            K[0,0], K[1,1] = fx_s, fy_s
+            K[0,2], K[1,2] = cx_s, cy_s
             Ks = K.unsqueeze(0)
 
             dummy_colors = torch.ones((self.all_points.shape[0], 3), device=self.device)
@@ -177,15 +194,15 @@ class PointCloud:
         if indices.numel() == 0: return None
 
         z_f = z_raw[indices]
-        points_cam = torch.stack([((indices % W).float() - self.cx) * z_f / self.fx,
-                                  ((indices // W).float() - self.cy) * z_f / self.fy,
+        points_cam = torch.stack([((indices % W).float() - cx_s) * z_f / fx_s,
+                                  ((indices // W).float() - cy_s) * z_f / fy_s,
                                   z_f], dim=1)
 
         R_corr = self.R_fix @ pose[:3, :3]
         t_corr = (self.R_fix @ pose[:3, 3].unsqueeze(-1)).squeeze(-1)
 
         points_world = (R_corr @ points_cam.T).T + t_corr
-        colors = rgb.reshape(-1, 3)[indices]
+        colors = rgb_s.reshape(-1, 3)[indices]
 
         pts, cols = points_world, colors
         k_idx = torch.arange(pts.shape[0], device=self.device)

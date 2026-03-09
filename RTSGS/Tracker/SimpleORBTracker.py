@@ -44,6 +44,15 @@ class SimpleORBTracker(Tracker):
 
         if self.prev_rgb is None:
             self.prev_rgb = cur_img
+            # Seed frame 0 as the first keyframe so points enter the map immediately
+            init_pose = self.poses[0].astype(np.float32)
+            if self.dataset is not None:
+                self.dataset.rgb_keyframes.append(rgb)
+                if depth is not None:
+                    self.dataset.depth_keyframes.append(depth)
+                self.keyframes_poses.append(init_pose)
+                self.last_kf_pose = init_pose
+                self.dataset.current_keyframe_index += 1
             return None
 
         prev_img = self.prev_rgb

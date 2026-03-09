@@ -6,7 +6,9 @@ from RTSGS.System import RTSGSSystem
 from RTSGS.Tracker.SimpleORBTracker import SimpleORBTracker
 from RTSGS.Config.Config import Config
 #from RTSGS.Tracker.SimpleOpen3DVO import SimpleOpen3DVO 
-
+import torch
+from torch.utils.cpp_extension import load
+import compile
 if __name__ == "__main__":
 
     # Load Data
@@ -21,7 +23,9 @@ if __name__ == "__main__":
     #data_path = "./Datasets/Replica/habitat_capture"
     #trajectory_path = "./Datasets/Replica/habitat_capture/trajectory_twc_eye.txt"
     #data = TUMDataLoader(os.path.join(data_path, "rgb"), os.path.join(data_path, "depth"),trajectory_path)
-
+    print(torch.__version__) 
+    torch.cuda.init()
+    torch.zeros(1, device="cuda")
     # Replica
     data_path = "./Datasets/Replica/ThirdParty/Replica/room1/results"
     trajectory_path = "./Datasets/Replica/ThirdParty/Replica/room1/traj.txt"
