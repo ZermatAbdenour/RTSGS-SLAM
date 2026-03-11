@@ -35,7 +35,7 @@ if __name__ == "__main__":
     #config = Config()
     config = ReplicaConfig()
     print("Loading Data...")
-    data.load_data(2000)
+    data.load_data(100)
     print("Data Loaded.")
 
     # Initialize Tracker
