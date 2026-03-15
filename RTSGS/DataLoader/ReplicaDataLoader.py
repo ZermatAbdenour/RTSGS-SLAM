@@ -3,7 +3,7 @@ import numpy as np
 from RTSGS.DataLoader.DataLoader import DataLoader
 
 class ReplicaDataLoader(DataLoader):
-    def __init__(self, data_path, trajectory_path=None, fps=3):
+    def __init__(self, data_path, trajectory_path=None, fps=10):
         super().__init__(data_path, data_path)
         self._trajectory_path = trajectory_path
         self._fps = fps
