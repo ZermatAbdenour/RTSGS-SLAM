@@ -25,6 +25,10 @@ class Config:
             self.config_dict.setdefault("alpha_min", 0.01)
             self.config_dict.setdefault("alpha_max", 1.0)
             self.config_dict.setdefault("alpha_depth_scale", 0.0)
+            self.config_dict.setdefault("gs_points_lr_mult", 0.3)
+            self.config_dict.setdefault("gs_depth_loss_weight", 0.1)
+            self.config_dict.setdefault("gs_depth_huber_delta", 0.05)
+            self.config_dict.setdefault("use_rendered_depth_icp", True)
 
     def get_camera_intrinsics(self):
         intrinsics = np.array([[self.config_dict['fx'], 0, self.config_dict['cx']],

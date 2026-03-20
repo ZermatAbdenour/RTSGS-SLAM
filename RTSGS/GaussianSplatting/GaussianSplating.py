@@ -98,7 +98,7 @@ def frustum_cull_mask(
 
 
 class GaussianSplatting:
-    def __init__(self, pcd, dataset, tracker, learning_rate=7e-3, max_steps_per_sec=10, downsample_factor=2.0):
+    def __init__(self, pcd, dataset, tracker, learning_rate=7e-4, max_steps_per_sec=10, downsample_factor=2.0):
         self.pcd = pcd
         self.dataset = dataset
         self.device = pcd.device
@@ -113,6 +113,11 @@ class GaussianSplatting:
         self.num_points_optimized = 0
         self.optimizer = None
         self.iteration_count = 0
+
+        # Loss and optimization knobs
+        self.points_lr_mult = float(self.tracker.config.get('gs_points_lr_mult', 0.3))
+        self.depth_loss_weight = float(self.tracker.config.get('gs_depth_loss_weight', 0.1))
+        self.depth_huber_delta = float(self.tracker.config.get('gs_depth_huber_delta', 0.05))
 
         # Token-bucket limiter: smooth "max_steps_per_sec"
         self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=2.0)
@@ -129,17 +134,82 @@ class GaussianSplatting:
         self.cull_pad_px = 4.0
         self.min_culled_points = 2048  # avoid pathological tiny sets
 
+    @torch.no_grad()
+    def render_depth_at_pose(self, pose_np: np.ndarray):
+        """
+        Render expected depth (meters) for a given camera pose (world-from-camera 4x4).
+        Returns depth map (H, W) float32 on CPU, or None when rendering is not possible.
+        """
+        if self.pcd.all_points is None:
+            return None
+
+        if pose_np is None:
+            return None
+
+        means = self.pcd.all_points
+        quats = self.pcd.all_quaternions
+        scales = self.pcd.all_scales
+        alpha = self.pcd.all_alpha
+
+        if means is None or means.shape[0] == 0:
+            return None
+
+        pose = torch.from_numpy(np.asarray(pose_np, dtype=np.float32)).to(self.device)
+
+        T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        T_fix[:3, :3] = self.pcd.R_fix
+        viewmat = torch.inverse(T_fix @ pose).unsqueeze(0)
+
+        K = _build_K(
+            fx=float(self.pcd.fx),
+            fy=float(self.pcd.fy),
+            cx=float(self.pcd.cx),
+            cy=float(self.pcd.cy),
+            device=self.device,
+        ).unsqueeze(0)
+
+        ones = torch.ones((means.shape[0], 3), device=self.device, dtype=means.dtype)
+
+        try:
+            rendered, _, _ = rendering.rasterization(
+                means=means,
+                quats=F.normalize(quats, p=2, dim=-1),
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(alpha).squeeze(-1),
+                colors=ones,
+                viewmats=viewmat,
+                Ks=K,
+                width=self.width,
+                height=self.height,
+                render_mode="RGB+ED",
+            )
+        except Exception:
+            return None
+
+        if rendered.shape[-1] < 4:
+            return None
+
+        depth = rendered[0, ..., 3]
+        if depth is None:
+            return None
+
+        depth = depth.detach().to(torch.float32).cpu().numpy()
+        depth[~np.isfinite(depth)] = 0.0
+        depth[depth < 0.0] = 0.0
+        return depth
+
     def _setup_optimizer(self):
         if self.pcd.all_points is None:
             return
 
-        attrs = ["all_sh", "all_scales", "all_quaternions", "all_alpha"]
+        attrs = ["all_points", "all_sh", "all_scales", "all_quaternions", "all_alpha"]
         for attr in attrs:
             val = getattr(self.pcd, attr)
             if not isinstance(val, torch.nn.Parameter):
                 setattr(self.pcd, attr, torch.nn.Parameter(val.detach().requires_grad_(True)))
 
         params = [
+            {'params': [self.pcd.all_points], 'lr': self.base_lr * self.points_lr_mult, "name": "points"},
             {'params': [self.pcd.all_sh], 'lr': self.base_lr * 3.0, "name": "sh"},
             {'params': [self.pcd.all_scales], 'lr': self.base_lr * 3.0, "name": "scales"},
             {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 1.0, "name": "quats"},
@@ -211,6 +281,12 @@ class GaussianSplatting:
         b = 2 if kf_count >= 2 else 1
         sample_idx = np.random.choice(kf_count, b, replace=False)
         gt_rgb_np = [self.dataset.rgb_keyframes[i] for i in sample_idx]
+        can_use_depth = (
+            self.depth_loss_weight > 0.0
+            and len(self.dataset.depth_keyframes) > 0
+            and max(sample_idx) < len(self.dataset.depth_keyframes)
+        )
+        gt_depth_np = [self.dataset.depth_keyframes[i] for i in sample_idx] if can_use_depth else None
         poses_np = [self.tracker.keyframes_poses[i].copy() for i in sample_idx]
 
         # 1) GT (downsample)
@@ -223,6 +299,17 @@ class GaussianSplatting:
             mode='bilinear',
             align_corners=False
         ).permute(0, 2, 3, 1)
+
+        gt_depths = None
+        if gt_depth_np is not None:
+            gt_depths_full = torch.stack(
+                [torch.from_numpy(dep).to(self.device).float().div_(float(self.pcd.depth_scale)) for dep in gt_depth_np]
+            )
+            gt_depths = F.interpolate(
+                gt_depths_full.unsqueeze(1),
+                size=(self.train_height, self.train_width),
+                mode='nearest'
+            ).squeeze(1)
 
         # 2) Camera mats
         T_fix = torch.eye(4, device=self.device)
@@ -285,17 +372,34 @@ class GaussianSplatting:
         colors = torch.sigmoid(spherical_harmonics(sh_degree, dirs, sh_coeffs))
 
         # 5) Rasterization on culled set
-        rendered_rgb, _, info = rendering.rasterization(
-            means=means,
-            quats=F.normalize(quats, p=2, dim=-1),
-            scales=torch.exp(scales),
-            opacities=torch.sigmoid(alpha).squeeze(-1),
-            colors=colors,
-            viewmats=viewmats,
-            Ks=Ks,
-            width=self.train_width,
-            height=self.train_height,
-        )
+        try:
+            rendered, _, info = rendering.rasterization(
+                means=means,
+                quats=F.normalize(quats, p=2, dim=-1),
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(alpha).squeeze(-1),
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=self.train_width,
+                height=self.train_height,
+                render_mode="RGB+ED",
+            )
+        except Exception:
+            rendered, _, info = rendering.rasterization(
+                means=means,
+                quats=F.normalize(quats, p=2, dim=-1),
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(alpha).squeeze(-1),
+                colors=colors,
+                viewmats=viewmats,
+                Ks=Ks,
+                width=self.train_width,
+                height=self.train_height,
+            )
+
+        rendered_rgb = rendered[..., :3]
+        rendered_depth = rendered[..., 3] if rendered.shape[-1] > 3 else None
 
         # 6) Loss/backward
         l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
@@ -304,7 +408,19 @@ class GaussianSplatting:
             gt_rgbs.permute(0, 3, 1, 2),
             data_range=1.0
         )
-        total_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)
+        rgb_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)
+
+        depth_loss = torch.zeros((), device=self.device)
+        if gt_depths is not None and rendered_depth is not None:
+            valid = (gt_depths > 0.0) & torch.isfinite(gt_depths) & torch.isfinite(rendered_depth) & (rendered_depth > 0.0)
+            if valid.any():
+                depth_loss = F.smooth_l1_loss(
+                    rendered_depth[valid],
+                    gt_depths[valid],
+                    beta=self.depth_huber_delta,
+                )
+
+        total_loss = rgb_loss + self.depth_loss_weight * depth_loss
 
         if total_loss > 0:
             total_loss.backward()

@@ -59,6 +59,9 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.prev_depth_m: np.ndarray | None = None
         self.prev_rgb: np.ndarray | None = None
         self.prev_rel_T = torch.eye(4, dtype=torch.float32, device=self.device)
+        self.rendered_depth_provider = None
+        self.use_rendered_depth_icp = bool(config.get("use_rendered_depth_icp", True))
+        self.last_ref_depth_source = "prev"
 
         self.viz_img = None
         self.img_window = None
@@ -80,7 +83,7 @@ class ProjectedPointToPlaneTracker(Tracker):
         if self.prev_depth_m is None:
             self.prev_depth_m = depth_m
             self.prev_rgb = rgb
-            self.viz_img = self._make_tracking_debug_image(rgb, depth_m, depth_m)
+            self.viz_img = self._make_tracking_debug_image(rgb, depth_m, depth_m, "init")
             init_pose = self.poses[0].astype(np.float32)
             if self.dataset is not None:
                 self.dataset.rgb_keyframes.append(rgb)
@@ -90,8 +93,31 @@ class ProjectedPointToPlaneTracker(Tracker):
                 self.dataset.current_keyframe_index += 1
             return None
 
-        T_rel = self._point_to_plane_icp(self.prev_depth_m, depth_m, self.prev_rel_T)
-        self.viz_img = self._make_tracking_debug_image(rgb, self.prev_depth_m, depth_m)
+        ref_depth_m = None
+        self.last_ref_depth_source = "prev"
+
+        if self.use_rendered_depth_icp and self.rendered_depth_provider is not None and len(self.poses) > 0:
+            try:
+                rendered_depth = self.rendered_depth_provider(self.poses[-1])
+            except Exception:
+                rendered_depth = None
+
+            if rendered_depth is not None:
+                rendered_depth = np.asarray(rendered_depth, dtype=np.float32)
+                if rendered_depth.shape == depth_m.shape:
+                    rendered_depth = self._preprocess_depth(rendered_depth)
+                    valid_rendered = np.count_nonzero(
+                        (rendered_depth > self.depth_min) & (rendered_depth < self.depth_max) & np.isfinite(rendered_depth)
+                    )
+                    if valid_rendered >= self.icp_min_pairs:
+                        ref_depth_m = rendered_depth
+                        self.last_ref_depth_source = "rendered"
+
+        if ref_depth_m is None:
+            ref_depth_m = self.prev_depth_m
+
+        T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, self.prev_rel_T)
+        self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
         if T_rel is None:
             self.prev_depth_m = depth_m
             self.prev_rgb = rgb
@@ -120,6 +146,10 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.prev_depth_m = depth_m
         self.prev_rgb = rgb
         return pose
+
+    def set_rendered_depth_provider(self, provider):
+        """Set callable provider: provider(pose_4x4_np) -> depth_m (H,W) or None."""
+        self.rendered_depth_provider = provider
 
     def visualize_tracking(self):
         if self.viz_img is None:
@@ -154,6 +184,7 @@ class ProjectedPointToPlaneTracker(Tracker):
         imgui.text(f"Last ICP pairs: {self.last_icp_pairs}")
         imgui.text(f"Last ICP iterations: {self.last_icp_iterations}")
         imgui.text(f"Last ICP RMSE: {self.last_icp_rmse:.5f} m")
+        imgui.text(f"Ref depth source: {self.last_ref_depth_source}")
 
         if self.dataset is not None and getattr(self.dataset, "time_stamps", None) is not None and self.dataset.time_stamps.shape[0] > 1:
             fps = self.dataset.time_stamps.shape[0] / (self.dataset.time_stamps[-1] - self.dataset.time_stamps[0])
@@ -710,14 +741,14 @@ class ProjectedPointToPlaneTracker(Tracker):
         aligned = (scale * (R @ src.T)).T + t
         return aligned.astype(np.float32), (float(scale), R.astype(np.float32), t.astype(np.float32))
 
-    def _make_tracking_debug_image(self, rgb, prev_depth_m, cur_depth_m):
+    def _make_tracking_debug_image(self, rgb, ref_depth_m, cur_depth_m, ref_label="ref"):
         if rgb is None:
             return None
 
         rgb_vis = rgb if rgb.ndim == 3 else cv2.cvtColor(rgb, cv2.COLOR_GRAY2BGR)
         h, w = rgb_vis.shape[:2]
 
-        prev_color = self._depth_to_colormap(prev_depth_m, h, w)
+        prev_color = self._depth_to_colormap(ref_depth_m, h, w)
         cur_color = self._depth_to_colormap(cur_depth_m, h, w)
 
         top = np.hstack([rgb_vis, prev_color])
@@ -725,7 +756,7 @@ class ProjectedPointToPlaneTracker(Tracker):
         canvas = np.vstack([top, bottom])
 
         cv2.putText(canvas, "RGB", (10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
-        cv2.putText(canvas, "Prev Depth", (w + 10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(canvas, f"Ref Depth ({ref_label})", (w + 10, 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
         cv2.putText(canvas, "Cur Depth", (w + 10, h + 24), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 255, 255), 2, cv2.LINE_AA)
 
         return canvas
