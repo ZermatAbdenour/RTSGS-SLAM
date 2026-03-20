@@ -181,16 +181,17 @@ class GaussianSplatting:
                 Ks=K,
                 width=self.width,
                 height=self.height,
-                render_mode="RGB+ED",
+                render_mode="ED",
             )
         except Exception:
             return None
 
-        if rendered.shape[-1] < 4:
-            return None
-
-        depth = rendered[0, ..., 3]
-        if depth is None:
+        # ED may return (..., 1) or (...,) depending on gsplat version.
+        if rendered.ndim == 4 and rendered.shape[-1] >= 1:
+            depth = rendered[0, ..., 0]
+        elif rendered.ndim == 3:
+            depth = rendered[0, ...]
+        else:
             return None
 
         depth = depth.detach().to(torch.float32).cpu().numpy()
