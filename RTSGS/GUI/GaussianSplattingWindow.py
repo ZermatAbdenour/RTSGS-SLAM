@@ -63,9 +63,11 @@ class GaussianSplattingWindow:
         self.image_widget = ImageWidget(np.zeros((camera.height, camera.width, 3), dtype=np.uint8))
         self.is_open = True
 
-        # Pull fx/fy once; if you change intrinsics dynamically, update these externally.
-        self.fx = float(pcd.fx.item()) if torch.is_tensor(pcd.fx) else float(pcd.fx)
-        self.fy = float(pcd.fy.item()) if torch.is_tensor(pcd.fy) else float(pcd.fy)
+        # GUI render path should use RGB intrinsics.
+        fx_src = getattr(pcd, "rgb_fx", pcd.fx)
+        fy_src = getattr(pcd, "rgb_fy", pcd.fy)
+        self.fx = float(fx_src.item()) if torch.is_tensor(fx_src) else float(fx_src)
+        self.fy = float(fy_src.item()) if torch.is_tensor(fy_src) else float(fy_src)
         self.default_scale = 0.01
 
         # cached tiny tensors

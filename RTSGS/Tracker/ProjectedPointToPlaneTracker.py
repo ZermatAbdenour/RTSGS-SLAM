@@ -23,8 +23,9 @@ class ProjectedPointToPlaneTracker(Tracker):
     def __init__(self, dataset: DataLoader, config):
         super().__init__(dataset, config)
 
-        self.fx, self.fy = float(config.get("fx")), float(config.get("fy"))
-        self.cx, self.cy = float(config.get("cx")), float(config.get("cy"))
+        K_depth = config.get_depth_intrinsics()
+        self.fx, self.fy = float(K_depth[0, 0]), float(K_depth[1, 1])
+        self.cx, self.cy = float(K_depth[0, 2]), float(K_depth[1, 2])
         self.depth_scale = float(config.get("depth_scale"))
 
         self.alpha = float(config.get("kf_translation", 0.05))

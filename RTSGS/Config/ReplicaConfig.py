@@ -4,13 +4,20 @@ class ReplicaConfig(Config):
     def __init__(self, config_dict=None):
         super().__init__(config_dict)
 
-        self.set('fx', 600.0)
-        self.set('fy', 600.0)
-        self.set('cx', 599.5)
-        self.set('cy', 339.5)
+        self.set('rgb_fx', 600.0)
+        self.set('rgb_fy', 600.0)
+        self.set('rgb_cx', 599.5)
+        self.set('rgb_cy', 339.5)
 
-        self.set('width', 1200)
-        self.set('height', 680)
+        self.set('depth_fx', 600.0)
+        self.set('depth_fy', 600.0)
+        self.set('depth_cx', 599.5)
+        self.set('depth_cy', 339.5)
+
+        self.set('rgb_width', 1200)
+        self.set('rgb_height', 680)
+        self.set('depth_width', 1200)
+        self.set('depth_height', 680)
         self.set('depth_scale', 6553.5) 
 
         self.set('voxel_size', 0.03)

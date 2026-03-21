@@ -11,11 +11,23 @@ class PointCloud:
         self.config = config
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        # Camera Parameters
-        self.fx = torch.tensor(float(config.get("fx")), device=self.device)
-        self.fy = torch.tensor(float(config.get("fy")), device=self.device)
-        self.cx = torch.tensor(float(config.get("cx")), device=self.device)
-        self.cy = torch.tensor(float(config.get("cy")), device=self.device)
+        # Camera parameters (depth camera for geometry, rgb camera for image supervision).
+        K_depth = config.get_depth_intrinsics()
+        K_rgb = config.get_rgb_intrinsics()
+
+        self.fx = torch.tensor(float(K_depth[0, 0]), device=self.device)
+        self.fy = torch.tensor(float(K_depth[1, 1]), device=self.device)
+        self.cx = torch.tensor(float(K_depth[0, 2]), device=self.device)
+        self.cy = torch.tensor(float(K_depth[1, 2]), device=self.device)
+
+        self.rgb_fx = torch.tensor(float(K_rgb[0, 0]), device=self.device)
+        self.rgb_fy = torch.tensor(float(K_rgb[1, 1]), device=self.device)
+        self.rgb_cx = torch.tensor(float(K_rgb[0, 2]), device=self.device)
+        self.rgb_cy = torch.tensor(float(K_rgb[1, 2]), device=self.device)
+
+        T_depth_to_rgb = config.get_T_depth_to_rgb()
+        self.R_depth_to_rgb = torch.from_numpy(T_depth_to_rgb[:3, :3]).to(self.device).float()
+        self.t_depth_to_rgb = torch.from_numpy(T_depth_to_rgb[:3, 3]).to(self.device).float()
 
         self.depth_scale = float(config.get("depth_scale", 1.0))
         self.voxel_size = float(config.get("voxel_size", 0.02))
@@ -121,7 +133,8 @@ class PointCloud:
         depth = torch.from_numpy(depth_np).to(self.device).float() / self.depth_scale
         pose = torch.from_numpy(pose_np).to(self.device).float()
 
-        H, W = depth.shape
+        H_d, W_d = depth.shape
+        H_r, W_r = rgb.shape[:2]
         z_raw = depth.reshape(-1)
         mask = z_raw > 0
         if self.pixel_subsample < 1.0:
@@ -131,15 +144,40 @@ class PointCloud:
         if indices.numel() == 0: return None
 
         z_f = z_raw[indices]
-        points_cam = torch.stack([((indices % W).float() - self.cx) * z_f / self.fx,
-                                  ((indices // W).float() - self.cy) * z_f / self.fy,
-                                  z_f], dim=1)
+        u_d = (indices % W_d).float()
+        v_d = (indices // W_d).float()
+        points_cam = torch.stack([
+            (u_d - self.cx) * z_f / self.fx,
+            (v_d - self.cy) * z_f / self.fy,
+            z_f,
+        ], dim=1)
+
+        # Reproject depth-camera points into RGB image for robust color lookup.
+        points_rgb_cam = (self.R_depth_to_rgb @ points_cam.T).T + self.t_depth_to_rgb
+        z_rgb = points_rgb_cam[:, 2]
+        valid_rgb = z_rgb > 1e-6
+        if not torch.any(valid_rgb):
+            return None
+
+        u_rgb = self.rgb_fx * (points_rgb_cam[:, 0] / z_rgb) + self.rgb_cx
+        v_rgb = self.rgb_fy * (points_rgb_cam[:, 1] / z_rgb) + self.rgb_cy
+
+        ui = torch.round(u_rgb).long()
+        vi = torch.round(v_rgb).long()
+        valid_rgb &= (ui >= 0) & (ui < W_r) & (vi >= 0) & (vi < H_r)
+        if not torch.any(valid_rgb):
+            return None
+
+        points_cam = points_cam[valid_rgb]
+        z_f = z_f[valid_rgb]
+        ui = ui[valid_rgb]
+        vi = vi[valid_rgb]
 
         R_corr = self.R_fix @ pose[:3, :3]
         t_corr = (self.R_fix @ pose[:3, 3].unsqueeze(-1)).squeeze(-1)
 
         points_world = (R_corr @ points_cam.T).T + t_corr
-        colors = rgb.reshape(-1, 3)[indices]
+        colors = rgb[vi, ui]
 
         res = self.novelty_filter_fast_with_gaussians(points_world, colors, self.novelty_voxel)
         if res is None: return None

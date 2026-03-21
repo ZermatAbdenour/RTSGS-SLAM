@@ -22,9 +22,10 @@ class ICPORBTracker(Tracker):
         self.dataset = dataset
 
         # intrinsics
-        self.fx, self.fy = config.get("fx"), config.get("fy")
-        self.cx, self.cy = config.get("cx"), config.get("cy")
-        self.K = config.get_camera_intrinsics()
+        K_depth = config.get_depth_intrinsics()
+        self.fx, self.fy = float(K_depth[0, 0]), float(K_depth[1, 1])
+        self.cx, self.cy = float(K_depth[0, 2]), float(K_depth[1, 2])
+        self.K = K_depth
 
         self.depth_scale = config.get("depth_scale")
         self.orb = cv2.ORB_create(nfeatures=Orb_features)

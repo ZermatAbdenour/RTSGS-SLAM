@@ -104,11 +104,12 @@ class GaussianSplatting:
         self.device = pcd.device
         self.base_lr = learning_rate
         self.tracker = tracker
-        self.width, self.height = tracker.config.get('width'), tracker.config.get('height')
+        self.rgb_width, self.rgb_height = tracker.config.get_rgb_size()
+        self.depth_width, self.depth_height = tracker.config.get_depth_size()
 
         self.downsample_factor = downsample_factor
-        self.train_width = int(self.width / downsample_factor)
-        self.train_height = int(self.height / downsample_factor)
+        self.train_width = int(self.rgb_width / downsample_factor)
+        self.train_height = int(self.rgb_height / downsample_factor)
 
         self.num_points_optimized = 0
         self.optimizer = None
@@ -179,8 +180,8 @@ class GaussianSplatting:
                 colors=ones,
                 viewmats=viewmat,
                 Ks=K,
-                width=self.width,
-                height=self.height,
+                width=self.depth_width,
+                height=self.depth_height,
                 render_mode="ED",
             )
         except Exception:
@@ -328,10 +329,10 @@ class GaussianSplatting:
         cam_centers = torch.stack(cam_centers, dim=0)
 
         K = _build_K(
-            fx=float(self.pcd.fx / self.downsample_factor),
-            fy=float(self.pcd.fy / self.downsample_factor),
-            cx=float(self.pcd.cx / self.downsample_factor),
-            cy=float(self.pcd.cy / self.downsample_factor),
+            fx=float(self.pcd.rgb_fx / self.downsample_factor),
+            fy=float(self.pcd.rgb_fy / self.downsample_factor),
+            cx=float(self.pcd.rgb_cx / self.downsample_factor),
+            cy=float(self.pcd.rgb_cy / self.downsample_factor),
             device=self.device,
         )
         Ks = K.unsqueeze(0).expand(b, -1, -1)
