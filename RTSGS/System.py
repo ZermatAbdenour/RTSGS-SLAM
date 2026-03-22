@@ -51,12 +51,19 @@ class RTSGSSystem:
             next_kf = self.last_added_keyframe_idx + 1
             
             if next_kf < self.dataset.current_keyframe_index:
+                rendered_depth_kf = None
+                if hasattr(self.tracker, "keyframes_rendered_depth_m"):
+                    kf_rendered = getattr(self.tracker, "keyframes_rendered_depth_m")
+                    if next_kf < len(kf_rendered):
+                        rendered_depth_kf = kf_rendered[next_kf]
+
                 success = self.pcd.update_async(
                     self.dataset.rgb_keyframes[next_kf],
                     self.dataset.depth_keyframes[next_kf],
-                    self.tracker.keyframes_poses[next_kf]
+                    self.tracker.keyframes_poses[next_kf],
+                    rendered_depth_kf,
                 )
-                
+                     
                 if success:
                     print(f"Update triggered for keyframe: {next_kf}")
                     self.last_added_keyframe_idx = next_kf

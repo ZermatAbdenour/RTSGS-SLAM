@@ -32,6 +32,7 @@ class PointCloud:
         self.depth_scale = float(config.get("depth_scale", 1.0))
         self.voxel_size = float(config.get("voxel_size", 0.02))
         self.novelty_voxel = float(config.get("novelty_voxel", self.voxel_size))
+        self.projection_depth_diff_threshold_m = float(config.get("projection_depth_diff_threshold_m", 0.10))
 
         # SH Parameters
         self.sh_degree = int(config.get("sh_degree", 1))
@@ -127,7 +128,7 @@ class PointCloud:
                F.normalize(reduce_mean(quats, 4), p=2, dim=1), reduce_mean(alpha, 1)
 
     @torch.no_grad()
-    def process_single_keyframe(self, rgb_np, depth_np, pose_np):
+    def process_single_keyframe(self, rgb_np, depth_np, pose_np, rendered_depth_np=None):
         """Processes a single keyframe: Image + Depth + Pose -> Filtered Gaussians."""
         rgb = torch.from_numpy(rgb_np).to(self.device).float() / 255.0
         depth = torch.from_numpy(depth_np).to(self.device).float() / self.depth_scale
@@ -137,6 +138,16 @@ class PointCloud:
         H_r, W_r = rgb.shape[:2]
         z_raw = depth.reshape(-1)
         mask = z_raw > 0
+
+        # Optionally skip points that are too close to the last rendered depth.
+        if rendered_depth_np is not None:
+            rendered_depth = torch.from_numpy(np.asarray(rendered_depth_np)).to(self.device).float()
+            if rendered_depth.shape == depth.shape:
+                rendered_raw = rendered_depth.reshape(-1)
+                rendered_valid = torch.isfinite(rendered_raw) & (rendered_raw > 0)
+                close_to_render = torch.abs(z_raw - rendered_raw) < self.projection_depth_diff_threshold_m
+                mask &= ~(rendered_valid & close_to_render)
+
         if self.pixel_subsample < 1.0:
             mask &= (torch.rand(z_raw.shape, device=self.device) < self.pixel_subsample)
         
@@ -192,7 +203,7 @@ class PointCloud:
         scales, quats, alpha = self._make_gaussians_batch(points_cam[k_idx], R_corr, z_f[k_idx])
         return self.voxel_filter_with_gaussians(pts, sh_full, scales, quats, alpha, self.voxel_size)
 
-    def update_async(self, rgb_np, depth_np, pose_np):
+    def update_async(self, rgb_np, depth_np, pose_np, rendered_depth_np=None):
         """Non-blocking call to process and add a keyframe to the map."""
         if self.is_processing:
             return False # Busy processing previous frame
@@ -201,7 +212,7 @@ class PointCloud:
 
         def _task():
             try:
-                new_data = self.process_single_keyframe(rgb_np, depth_np, pose_np)
+                new_data = self.process_single_keyframe(rgb_np, depth_np, pose_np, rendered_depth_np)
                 if new_data is not None:
                     self._merge_data(new_data)
             finally:

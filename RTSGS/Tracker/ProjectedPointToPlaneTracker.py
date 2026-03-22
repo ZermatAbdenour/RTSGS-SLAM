@@ -63,6 +63,8 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.rendered_depth_provider = None
         self.use_rendered_depth_icp = bool(config.get("use_rendered_depth_icp", True))
         self.last_ref_depth_source = "prev"
+        self.last_rendered_depth_m: np.ndarray | None = None
+        self.keyframes_rendered_depth_m = []
 
         self.viz_img = None
         self.img_window = None
@@ -90,6 +92,7 @@ class ProjectedPointToPlaneTracker(Tracker):
                 self.dataset.rgb_keyframes.append(rgb)
                 self.dataset.depth_keyframes.append(depth)
                 self.keyframes_poses.append(init_pose)
+                self.keyframes_rendered_depth_m.append(None)
                 self.last_kf_pose = init_pose
                 self.dataset.current_keyframe_index += 1
             return None
@@ -107,6 +110,7 @@ class ProjectedPointToPlaneTracker(Tracker):
                 rendered_depth = np.asarray(rendered_depth, dtype=np.float32)
                 if rendered_depth.shape == depth_m.shape:
                     rendered_depth = self._preprocess_depth(rendered_depth)
+                    self.last_rendered_depth_m = rendered_depth
                     valid_rendered = np.count_nonzero(
                         (rendered_depth > self.depth_min) & (rendered_depth < self.depth_max) & np.isfinite(rendered_depth)
                     )
@@ -141,6 +145,10 @@ class ProjectedPointToPlaneTracker(Tracker):
             self.dataset.rgb_keyframes.append(rgb)
             self.dataset.depth_keyframes.append(depth)
             self.keyframes_poses.append(pose.astype(np.float32))
+            if self.last_rendered_depth_m is None:
+                self.keyframes_rendered_depth_m.append(None)
+            else:
+                self.keyframes_rendered_depth_m.append(self.last_rendered_depth_m.copy())
             self.last_kf_pose = pose
             self.dataset.current_keyframe_index += 1
 
