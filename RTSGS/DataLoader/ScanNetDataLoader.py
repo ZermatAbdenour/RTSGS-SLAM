@@ -7,10 +7,11 @@ from RTSGS.DataLoader.DataLoader import DataLoader
 class ScanNetDataLoader(DataLoader):
     """ScanNet loader with explicit RGB/depth calibration support."""
 
-    def __init__(self, scene_extracted_path: str, config, fps: float = 30.0):
+    def __init__(self, scene_extracted_path: str, config, trajectory_path: str = None, fps: float = 1.0):
         self._scene_extracted_path = scene_extracted_path
         self._intrinsic_dir = os.path.join(scene_extracted_path, "intrinsic")
-        self._pose_dir = os.path.join(scene_extracted_path, "pose")
+        self._trajectory_path = trajectory_path
+        self._pose_dir = trajectory_path if trajectory_path is not None else os.path.join(scene_extracted_path, "pose")
 
         rgb_path = os.path.join(scene_extracted_path, "color")
         depth_path = os.path.join(scene_extracted_path, "depth")
@@ -88,6 +89,9 @@ class ScanNetDataLoader(DataLoader):
 
     def load_data(self, limit: int = -1):
         self._configure_intrinsics()
+
+        if not os.path.isdir(self._pose_dir):
+            raise RuntimeError(f"Missing ScanNet trajectory directory: {self._pose_dir}")
 
         rgb_files = [f for f in os.listdir(self._rgb_path) if f.lower().endswith(".jpg")]
         depth_files = [f for f in os.listdir(self._depth_path) if f.lower().endswith(".png")]

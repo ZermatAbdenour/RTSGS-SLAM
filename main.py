@@ -22,23 +22,26 @@ if __name__ == "__main__":
         torch.zeros(1, device="cuda")
 
     # TUM
-    data_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household"
-    trajectory_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household/groundtruth.txt"
-    data = TUMDataLoader(os.path.join(data_path, "rgb"), os.path.join(data_path, "depth"),trajectory_path)
+    #data_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household"
+    #trajectory_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household/groundtruth.txt"
+    #data = TUMDataLoader(os.path.join(data_path, "rgb"), os.path.join(data_path, "depth"),trajectory_path)
 
     # Replica
     #data_path = "./Datasets/Replica/ThirdParty/Replica/room1/results"
     #trajectory_path = "./Datasets/Replica/ThirdParty/Replica/room1/traj.txt"
     #data = ReplicaDataLoader(data_path=data_path,trajectory_path=trajectory_path)
 
-    # ScanNet (separate RGB/depth intrinsics)
-    #scene_extracted_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted"
-    #config = ScanNetConfig()
-    #data = ScanNetDataLoader(scene_extracted_path, config)
+    # ScanNet
+    scene_extracted_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted"
+    trajectory_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted/pose"
+    config = ScanNetConfig()
+    data = ScanNetDataLoader(scene_extracted_path, config, trajectory_path=trajectory_path)
 
-    config = Config()
+    #config = Config()
     #config = ReplicaConfig()
+    config = ScanNetConfig()
     print("Loading Data...")
+    
     data.load_data(1000)
     print("Data Loaded.")
 
