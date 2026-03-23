@@ -13,7 +13,7 @@ from RTSGS.GaussianSplatting.Renderer.Camera import Camera
 from RTSGS.GUI import context
 from RTSGS.GUI.theme import apply_theme_v3
 class WindowManager:
-    def __init__(self,point_cloud:PointCloud,gs:GaussianSplatting, width=1280, height=720, title="Modular Docking"):
+    def __init__(self,point_cloud:PointCloud,gs:GaussianSplatting, tracker=None, dataset=None, width=1280, height=720, title="Modular Docking"):
         self.width = width
         self.height = height
         self.title = title
@@ -64,7 +64,7 @@ class WindowManager:
         self.performance_window = PerformanceWindow()
         self.profiler_window = ProfilerWindow()
         camera = Camera()
-        self.opengl_renderer = Renderer(point_cloud,camera)
+        self.opengl_renderer = Renderer(point_cloud, camera, tracker=tracker, dataset=dataset)
         self.viewport_window = ViewportWindow(self.opengl_renderer)
         self.gaussian_splating_window = GaussianSplattingWindow(point_cloud,camera)
         #time

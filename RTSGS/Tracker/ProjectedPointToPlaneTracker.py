@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+import csv
+import os
+from datetime import datetime
+
 import cv2
 import numpy as np
 import torch
@@ -56,6 +60,7 @@ class ProjectedPointToPlaneTracker(Tracker):
 
         self.poses = [self._initial_pose_from_dataset(dataset)]
         self.last_kf_pose = None
+        self.keyframe_frame_indices = []
 
         self.prev_depth_m: np.ndarray | None = None
         self.prev_rgb: np.ndarray | None = None
@@ -75,6 +80,12 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.last_icp_iterations = 0
         self.last_icp_rmse = 0.0
 
+        self.metrics_run_name = ""
+        self.metrics_comment = ""
+        self.metrics_save_status = ""
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
+        self.metrics_csv_path = os.path.join(project_root, "logs", "trajectory_metrics.csv")
+
     def track_frame(self, rgb, depth=None):
         if depth is None:
             self.prev_rgb = rgb
@@ -92,6 +103,7 @@ class ProjectedPointToPlaneTracker(Tracker):
                 self.dataset.rgb_keyframes.append(rgb)
                 self.dataset.depth_keyframes.append(depth)
                 self.keyframes_poses.append(init_pose)
+                self.keyframe_frame_indices.append(0)
                 self.keyframes_rendered_depth_m.append(None)
                 self.last_kf_pose = init_pose
                 self.dataset.current_keyframe_index += 1
@@ -145,6 +157,7 @@ class ProjectedPointToPlaneTracker(Tracker):
             self.dataset.rgb_keyframes.append(rgb)
             self.dataset.depth_keyframes.append(depth)
             self.keyframes_poses.append(pose.astype(np.float32))
+            self.keyframe_frame_indices.append(len(self.poses) - 1)
             if self.last_rendered_depth_m is None:
                 self.keyframes_rendered_depth_m.append(None)
             else:
@@ -252,8 +265,50 @@ class ProjectedPointToPlaneTracker(Tracker):
             imgui.end()
             return
 
-        pred_aligned, (s, _, _) = self._umeyama_align(pred, gt, with_scale=True)
+        pred_aligned, (s, _, _) = self._umeyama_align(pred, gt, with_scale=False)
         imgui.text(f"Alignment: scale={s:.4f}")
+
+        metrics = self._compute_traj_metrics(pred, gt, pred_aligned)
+        if metrics is not None:
+            imgui.separator()
+            imgui.text("SLAM trajectory metrics")
+            imgui.text(f"Samples used: {metrics['num_samples']}")
+            imgui.text(
+                f"ATE RMSE (aligned): {metrics['ate_aligned_rmse_m']:.4f} m | "
+                f"Raw: {metrics['ate_raw_rmse_m']:.4f} m"
+            )
+            imgui.text(
+                f"ATE mean/median/std/max (aligned): "
+                f"{metrics['ate_aligned_mean_m']:.4f} / {metrics['ate_aligned_median_m']:.4f} / "
+                f"{metrics['ate_aligned_std_m']:.4f} / {metrics['ate_aligned_max_m']:.4f} m"
+            )
+            imgui.text(
+                f"RPE trans RMSE/mean (aligned): "
+                f"{metrics['rpe_trans_rmse_m']:.4f} / {metrics['rpe_trans_mean_m']:.4f} m"
+            )
+            imgui.text(
+                f"RPE rot RMSE/mean (aligned): "
+                f"{metrics['rpe_rot_rmse_deg']:.3f} / {metrics['rpe_rot_mean_deg']:.3f} deg"
+            )
+            imgui.text(
+                f"Path length pred/gt (aligned): "
+                f"{metrics['pred_path_len_m']:.3f} / {metrics['gt_path_len_m']:.3f} m "
+                f"(ratio={metrics['path_len_ratio']:.3f})"
+            )
+
+            imgui.separator()
+            _, self.metrics_run_name = imgui.input_text("Run name", self.metrics_run_name, 128)
+            _, self.metrics_comment = imgui.input_text("Comment", self.metrics_comment, 256)
+
+            if imgui.button("Save Metrics CSV"):
+                ok, msg = self._save_metrics_to_csv(metrics, float(s))
+                self.metrics_save_status = msg
+
+            if self.metrics_save_status:
+                if self.metrics_save_status.startswith("Saved"):
+                    imgui.text_colored((0.4, 0.9, 0.4, 1.0), self.metrics_save_status)
+                else:
+                    imgui.text_colored((1.0, 0.5, 0.5, 1.0), self.metrics_save_status)
 
         px = np.ascontiguousarray(pred_aligned[:, 0], dtype=np.float32)
         py = np.ascontiguousarray(pred_aligned[:, 1], dtype=np.float32)
@@ -749,6 +804,157 @@ class ProjectedPointToPlaneTracker(Tracker):
         t = mu_dst - scale * (R @ mu_src)
         aligned = (scale * (R @ src.T)).T + t
         return aligned.astype(np.float32), (float(scale), R.astype(np.float32), t.astype(np.float32))
+
+    @staticmethod
+    def _safe_stats(x: np.ndarray):
+        if x is None or x.size == 0:
+            return 0.0, 0.0, 0.0, 0.0, 0.0
+        x = np.asarray(x, dtype=np.float64)
+        rmse = float(np.sqrt(np.mean(x * x)))
+        mean = float(np.mean(x))
+        median = float(np.median(x))
+        std = float(np.std(x))
+        mx = float(np.max(x))
+        return rmse, mean, median, std, mx
+
+    @staticmethod
+    def _rotation_angle_deg(R: np.ndarray) -> float:
+        tr = float(np.trace(R))
+        c = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
+        return float(np.degrees(np.arccos(c)))
+
+    @staticmethod
+    def _compute_path_length(xyz: np.ndarray) -> float:
+        if xyz is None or xyz.shape[0] < 2:
+            return 0.0
+        d = xyz[1:] - xyz[:-1]
+        return float(np.linalg.norm(d, axis=1).sum())
+
+    def _compute_traj_metrics(self, pred_xyz: np.ndarray, gt_xyz: np.ndarray, pred_xyz_aligned: np.ndarray):
+        if pred_xyz is None or gt_xyz is None or pred_xyz_aligned is None:
+            return None
+        if pred_xyz.shape[0] < 3 or gt_xyz.shape[0] < 3 or pred_xyz_aligned.shape[0] < 3:
+            return None
+
+        e_raw = np.linalg.norm(pred_xyz - gt_xyz, axis=1)
+        e_aligned = np.linalg.norm(pred_xyz_aligned - gt_xyz, axis=1)
+        ate_raw_rmse, _, _, _, _ = self._safe_stats(e_raw)
+        ate_aligned_rmse, ate_aligned_mean, ate_aligned_median, ate_aligned_std, ate_aligned_max = self._safe_stats(e_aligned)
+
+        # Relative Pose Error (RPE) on position and heading change from successive frames.
+        d_pred = pred_xyz_aligned[1:] - pred_xyz_aligned[:-1]
+        d_gt = gt_xyz[1:] - gt_xyz[:-1]
+        rpe_trans = np.linalg.norm(d_pred - d_gt, axis=1)
+        rpe_trans_rmse, rpe_trans_mean, _, _, _ = self._safe_stats(rpe_trans)
+
+        # Rotation RPE from full poses when available, using frame-wise relative transforms.
+        rpe_rot_deg = np.array([], dtype=np.float64)
+        if self.dataset is not None and getattr(self.dataset, "gt_poses", None) is not None and len(self.poses) >= 3:
+            n = min(len(self.poses), len(self.dataset.gt_poses))
+            pred_pose = np.asarray(self.poses[:n], dtype=np.float64)
+            gt_pose = np.asarray(self.dataset.gt_poses[:n], dtype=np.float64)
+
+            valid = np.isfinite(pred_pose).all(axis=(1, 2)) & np.isfinite(gt_pose).all(axis=(1, 2))
+            pred_pose = pred_pose[valid]
+            gt_pose = gt_pose[valid]
+
+            if pred_pose.shape[0] >= 3:
+                pred_pos = pred_pose[:, :3, 3]
+                gt_pos = gt_pose[:, :3, 3]
+                _, (s, R_align, t_align) = self._umeyama_align(pred_pos, gt_pos, with_scale=False)
+
+                pred_pose_aligned = pred_pose.copy()
+                pred_pose_aligned[:, :3, :3] = R_align[None, :, :] @ pred_pose[:, :3, :3]
+                pred_pose_aligned[:, :3, 3] = (R_align @ pred_pos.T).T + t_align[None, :]
+
+                rot_err = []
+                for i in range(1, pred_pose_aligned.shape[0]):
+                    dP = np.linalg.inv(pred_pose_aligned[i - 1]) @ pred_pose_aligned[i]
+                    dG = np.linalg.inv(gt_pose[i - 1]) @ gt_pose[i]
+                    E = np.linalg.inv(dG) @ dP
+                    rot_err.append(self._rotation_angle_deg(E[:3, :3]))
+                if rot_err:
+                    rpe_rot_deg = np.asarray(rot_err, dtype=np.float64)
+
+        rpe_rot_rmse, rpe_rot_mean, _, _, _ = self._safe_stats(rpe_rot_deg)
+
+        pred_len = self._compute_path_length(pred_xyz_aligned)
+        gt_len = self._compute_path_length(gt_xyz)
+        ratio = float(pred_len / gt_len) if gt_len > 1e-12 else 0.0
+
+        return {
+            "num_samples": int(pred_xyz.shape[0]),
+            "ate_raw_rmse_m": float(ate_raw_rmse),
+            "ate_aligned_rmse_m": float(ate_aligned_rmse),
+            "ate_aligned_mean_m": float(ate_aligned_mean),
+            "ate_aligned_median_m": float(ate_aligned_median),
+            "ate_aligned_std_m": float(ate_aligned_std),
+            "ate_aligned_max_m": float(ate_aligned_max),
+            "rpe_trans_rmse_m": float(rpe_trans_rmse),
+            "rpe_trans_mean_m": float(rpe_trans_mean),
+            "rpe_rot_rmse_deg": float(rpe_rot_rmse),
+            "rpe_rot_mean_deg": float(rpe_rot_mean),
+            "pred_path_len_m": float(pred_len),
+            "gt_path_len_m": float(gt_len),
+            "path_len_ratio": float(ratio),
+        }
+
+    def _save_metrics_to_csv(self, metrics: dict, align_scale: float):
+        try:
+            os.makedirs(os.path.dirname(self.metrics_csv_path), exist_ok=True)
+
+            headers = [
+                "timestamp",
+                "run_name",
+                "comment",
+                "alignment_scale",
+                "num_samples",
+                "ate_raw_rmse_m",
+                "ate_aligned_rmse_m",
+                "ate_aligned_mean_m",
+                "ate_aligned_median_m",
+                "ate_aligned_std_m",
+                "ate_aligned_max_m",
+                "rpe_trans_rmse_m",
+                "rpe_trans_mean_m",
+                "rpe_rot_rmse_deg",
+                "rpe_rot_mean_deg",
+                "pred_path_len_m",
+                "gt_path_len_m",
+                "path_len_ratio",
+            ]
+
+            row = {
+                "timestamp": datetime.now().isoformat(timespec="seconds"),
+                "run_name": self.metrics_run_name.strip(),
+                "comment": self.metrics_comment.strip(),
+                "alignment_scale": float(align_scale),
+                "num_samples": int(metrics.get("num_samples", 0)),
+                "ate_raw_rmse_m": float(metrics.get("ate_raw_rmse_m", 0.0)),
+                "ate_aligned_rmse_m": float(metrics.get("ate_aligned_rmse_m", 0.0)),
+                "ate_aligned_mean_m": float(metrics.get("ate_aligned_mean_m", 0.0)),
+                "ate_aligned_median_m": float(metrics.get("ate_aligned_median_m", 0.0)),
+                "ate_aligned_std_m": float(metrics.get("ate_aligned_std_m", 0.0)),
+                "ate_aligned_max_m": float(metrics.get("ate_aligned_max_m", 0.0)),
+                "rpe_trans_rmse_m": float(metrics.get("rpe_trans_rmse_m", 0.0)),
+                "rpe_trans_mean_m": float(metrics.get("rpe_trans_mean_m", 0.0)),
+                "rpe_rot_rmse_deg": float(metrics.get("rpe_rot_rmse_deg", 0.0)),
+                "rpe_rot_mean_deg": float(metrics.get("rpe_rot_mean_deg", 0.0)),
+                "pred_path_len_m": float(metrics.get("pred_path_len_m", 0.0)),
+                "gt_path_len_m": float(metrics.get("gt_path_len_m", 0.0)),
+                "path_len_ratio": float(metrics.get("path_len_ratio", 0.0)),
+            }
+
+            write_header = (not os.path.exists(self.metrics_csv_path)) or (os.path.getsize(self.metrics_csv_path) == 0)
+            with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=headers)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+
+            return True, f"Saved metrics to {self.metrics_csv_path}"
+        except Exception as e:
+            return False, f"Failed to save metrics: {e}"
 
     def _make_tracking_debug_image(self, rgb, ref_depth_m, cur_depth_m, ref_label="ref"):
         if rgb is None:

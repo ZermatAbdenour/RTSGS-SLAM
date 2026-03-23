@@ -27,7 +27,15 @@ class RTSGSSystem:
         self.gs = GaussianSplatting(self.pcd, self.dataset, self.tracker)
         if hasattr(self.tracker, "set_rendered_depth_provider"):
             self.tracker.set_rendered_depth_provider(self.gs.render_depth_at_pose)
-        self.window = WindowManager(self.pcd, self.gs, 1280, 720, "RTSGS System")
+        self.window = WindowManager(
+            self.pcd,
+            self.gs,
+            tracker=self.tracker,
+            dataset=self.dataset,
+            width=1280,
+            height=720,
+            title="RTSGS System",
+        )
 
         # Track the last keyframe index added to the map
         self.last_added_keyframe_idx = -1
