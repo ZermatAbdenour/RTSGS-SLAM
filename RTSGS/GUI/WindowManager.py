@@ -11,6 +11,7 @@ from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GaussianSplatting.Renderer.OpenGLRenderer import Renderer
 from RTSGS.GaussianSplatting.Renderer.Camera import Camera
 from RTSGS.GUI import context
+from RTSGS.GUI.theme import apply_theme_v3
 class WindowManager:
     def __init__(self,point_cloud:PointCloud,gs:GaussianSplatting, width=1280, height=720, title="Modular Docking"):
         self.width = width
@@ -55,6 +56,7 @@ class WindowManager:
 
         io = imgui.get_io()
         io.config_flags |= imgui.ConfigFlags_.docking_enable
+        apply_theme_v3(hue07='C', alt07='C', nav07='O', lit01=0, compact01=0, border01=1, shape0123=1)
 
         self.renderer = GlfwRenderer(self.window)
 
