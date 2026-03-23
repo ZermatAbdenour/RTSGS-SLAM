@@ -1,3 +1,6 @@
 [submodule "Datasets/Replica/ThirdParty/Replica-Dataset"]
 	path = Datasets/Replica/ThirdParty/Replica-Dataset
 	url = https://github.com/facebookresearch/Replica-Dataset.git
+[submodule "ThirdParty/SoftGroup"]
+	path = ThirdParty/SoftGroup
+	url = https://github.com/thangvubk/SoftGroup.git
