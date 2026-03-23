@@ -23,9 +23,9 @@ class ScanNetConfig(Config):
         self.set("depth_height", 480)
 
         self.set("depth_scale", 1000.0)
-        self.set("voxel_size", 0.03)
+        self.set("voxel_size", 0.02)
 
-        self.set("sigma_px", 4.0)
+        self.set("sigma_px", 2.0)
         self.set("sigma_z0", 0.003)
         self.set("sigma_z1", 0.0)
         self.set("alpha_init", 1.0)

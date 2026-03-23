@@ -39,6 +39,7 @@ class SoftGroupPeriodicSegmenter:
         self._cfg = None
         self._voxelization_idx = None
         self._rng = np.random.default_rng(123)
+        self._class_names = []
 
     def _abs_path(self, p: str) -> str:
         if os.path.isabs(p):
@@ -119,9 +120,34 @@ class SoftGroupPeriodicSegmenter:
         self._cfg = cfg
         self._model = model
         self._voxelization_idx = voxelization_idx
+        self._class_names = self._get_class_names(cfg)
 
         print("[SoftGroup] Model loaded for periodic segmentation.")
         return True
+
+    def _get_class_names(self, cfg: Munch) -> list[str]:
+        data_type = str(cfg.data.test.type)
+        if data_type == "scannetv2":
+            from softgroup.data.scannetv2 import ScanNetDataset
+
+            return list(ScanNetDataset.CLASSES)
+        if data_type == "s3dis":
+            from softgroup.data.s3dis import S3DISDataset
+
+            return list(S3DISDataset.CLASSES)
+        if data_type == "stpls3d":
+            from softgroup.data.stpls3d import STPLS3DDataset
+
+            return list(STPLS3DDataset.CLASSES)
+        if data_type == "kitti":
+            from softgroup.data.kitti import KITTIDataset
+
+            return list(KITTIDataset.CLASSES)
+        return []
+
+    def _build_class_palette(self, num_classes: int) -> np.ndarray:
+        rng = np.random.default_rng(seed=123)
+        return rng.uniform(0.1, 0.95, size=(max(num_classes, 1), 3)).astype(np.float32)
 
     def _snapshot_pointcloud(self):
         with self.pcd.lock:
@@ -197,8 +223,7 @@ class SoftGroupPeriodicSegmenter:
         return batch, sampled_idx, n_total
 
     def _semantic_palette(self, labels: np.ndarray, num_classes: int) -> np.ndarray:
-        rng = np.random.default_rng(seed=123)
-        palette = rng.uniform(0.1, 0.95, size=(max(num_classes, 1), 3)).astype(np.float32)
+        palette = self._build_class_palette(num_classes)
         safe_labels = np.clip(labels.astype(np.int64), 0, palette.shape[0] - 1)
         return palette[safe_labels]
 
@@ -247,10 +272,17 @@ class SoftGroupPeriodicSegmenter:
         labels_full[sampled_idx] = semantic_preds
 
         num_classes = int(getattr(self._cfg.model, "semantic_classes", 1))
+        class_palette = self._build_class_palette(num_classes)
         seg_rgb = np.zeros((n_total, 3), dtype=np.float32)
         valid = labels_full >= 0
         if np.any(valid):
             seg_rgb[valid] = self._semantic_palette(labels_full[valid], num_classes)
+
+        class_names = list(self._class_names)
+        if len(class_names) < num_classes:
+            class_names.extend([f"class_{i}" for i in range(len(class_names), num_classes)])
+        elif len(class_names) > num_classes:
+            class_names = class_names[:num_classes]
 
         seg_encoded = self._encode_colors_for_shader(seg_rgb)
 
@@ -272,6 +304,8 @@ class SoftGroupPeriodicSegmenter:
                 "num_instances": int(len(pred_instances)),
                 "inference_ms": float(infer_ms),
                 "total_ms": float(total_ms),
+                "class_names": class_names,
+                "class_palette": class_palette.tolist(),
             },
         )
 

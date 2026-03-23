@@ -6,6 +6,7 @@ from RTSGS.GUI.ViewportWindow import ViewportWindow
 from RTSGS.GUI.PerformanceWindow import PerformanceWindow
 from RTSGS.GUI.ProfilerWindow import ProfilerWindow
 from RTSGS.GUI.GaussianSplattingWindow import GaussianSplattingWindow
+from RTSGS.GUI.SegmentationLegendWindow import SegmentationLegendWindow
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GaussianSplatting.Renderer.OpenGLRenderer import Renderer
@@ -67,6 +68,7 @@ class WindowManager:
         self.opengl_renderer = Renderer(point_cloud, camera, tracker=tracker, dataset=dataset)
         self.viewport_window = ViewportWindow(self.opengl_renderer)
         self.gaussian_splating_window = GaussianSplattingWindow(point_cloud,camera)
+        self.segmentation_legend_window = SegmentationLegendWindow(point_cloud)
         #time
         self._last_time = None
         self._delta_time = 0.016
@@ -89,6 +91,10 @@ class WindowManager:
                 clicked, _ = imgui.menu_item("Viewport", "", self.viewport_window.is_open, True)
                 if clicked:
                     self.viewport_window.is_open = not self.viewport_window.is_open
+
+                clicked, _ = imgui.menu_item("Segmentation Legend", "", self.segmentation_legend_window.is_open, True)
+                if clicked:
+                    self.segmentation_legend_window.is_open = not self.segmentation_legend_window.is_open
                 imgui.end_menu()
 
             imgui.end_main_menu_bar()
@@ -139,6 +145,9 @@ class WindowManager:
         
         if self.gaussian_splating_window.is_open:
             self.gaussian_splating_window.draw(self._delta_time)
+
+        if self.segmentation_legend_window.is_open:
+            self.segmentation_legend_window.draw()
 
     def render_frame(self):
         self.update_delta_time()
