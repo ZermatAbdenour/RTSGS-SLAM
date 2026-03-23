@@ -10,7 +10,7 @@ void main(){
     float distance = length(view_pos.xyz);
     
     gl_Position = u_projection * view_pos;
-    gl_PointSize = 5.0 / distance;
+    gl_PointSize = 10.0 / distance;
     
     Color = aColor;
 }

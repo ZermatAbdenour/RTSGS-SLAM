@@ -1,5 +1,5 @@
 from RTSGS.Config.Config import Config
-
+import numpy as np
 
 class ScanNetConfig(Config):
     def __init__(self, config_dict=None):
@@ -37,3 +37,5 @@ class ScanNetConfig(Config):
         self.set("gs_depth_loss_weight", 0.1)
         self.set("gs_depth_huber_delta", 0.05)
         self.set("use_rendered_depth_icp", True)
+        self.set('kf_translation',0.1)
+        self.set('kf_rotation',35.0 * np.pi / 180.0)

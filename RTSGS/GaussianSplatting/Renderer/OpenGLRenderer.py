@@ -42,6 +42,10 @@ class Renderer:
         self._pose_cache_sig = None
         self._pose_dirty = True
 
+        self.use_segmentation_colors = False
+        self._last_color_mode = False
+        self._last_segmentation_version = -1
+
         # Opengl 
         # Enable depth testing for 3D points
         self.fb.bind()
@@ -332,22 +336,22 @@ class Renderer:
 
         glBindVertexArray(0)
         self._initialized = True
-        # UPDATED: Pass all_sh
-        self.update_vbo(self.pcd.all_points, self.pcd.all_sh)
 
-    def update_vbo(self, positions, sh_coeffs):
-        # The arguments 'positions' and 'sh_coeffs' passed from render_pcd
+    def set_use_segmentation_colors(self, enabled: bool):
+        self.use_segmentation_colors = bool(enabled)
+
+    def update_vbo(self, positions, color_coeffs):
+        # The arguments passed from render_pcd
         # are already detached/referenced under the lock there.
         if positions is None or positions.numel() == 0:
             return
 
         # Convert to numpy under the assumption these are consistent snapshots
-        # We take the 0th order SH (index 0) and the XYZ positions
-        sh0_data = sh_coeffs[:, 0, :].detach().cpu().numpy().astype(np.float32)
+        color_data = color_coeffs.detach().cpu().numpy().astype(np.float32)
         positions_data = positions.detach().cpu().numpy().astype(np.float32)
         
         # This will now succeed because they were grabbed under the lock together
-        interleaved = np.hstack([positions_data, sh0_data])
+        interleaved = np.hstack([positions_data, color_data])
         required_bytes = interleaved.nbytes
 
         glBindBuffer(GL_ARRAY_BUFFER, self.vbo)
@@ -377,14 +381,30 @@ class Renderer:
                 return
 
             current_count = self.pcd.all_points.shape[0]
+            seg_version = int(getattr(self.pcd, "segmentation_version", 0))
+            use_seg = bool(self.use_segmentation_colors)
+
+            color_coeffs = self.pcd.all_sh[:, 0, :]
+            if use_seg:
+                seg_logits = getattr(self.pcd, "segmentation_color_logits", None)
+                if seg_logits is not None and int(seg_logits.shape[0]) == int(current_count):
+                    color_coeffs = seg_logits
             
             # 2. Check if we need to update the OpenGL buffers
             # Only run the heavy upload if the point count changed
             if not self._initialized:
                 self._initialize_pcd_rendering()
-            elif self.pcd_added_size != current_count:
+                self.update_vbo(self.pcd.all_points, color_coeffs)
+            elif (
+                self.pcd_added_size != current_count
+                or self._last_color_mode != use_seg
+                or (use_seg and self._last_segmentation_version != seg_version)
+            ):
                 # We pass the tensors directly while inside the lock
-                self.update_vbo(self.pcd.all_points, self.pcd.all_sh)
+                self.update_vbo(self.pcd.all_points, color_coeffs)
+
+            self._last_color_mode = use_seg
+            self._last_segmentation_version = seg_version
 
         # 3. Standard OpenGL Drawing (Outside the lock to keep it fast)
         res.simple_shader.use()

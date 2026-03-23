@@ -23,6 +23,21 @@ class ViewportWindow:
         if(not expended):
             imgui.end()
             return int(self.fb.width), int(self.fb.height)
+
+        changed, use_seg = imgui.checkbox(
+            "Use segmentation colors",
+            bool(getattr(self.renderer, "use_segmentation_colors", False)),
+        )
+        if changed and hasattr(self.renderer, "set_use_segmentation_colors"):
+            self.renderer.set_use_segmentation_colors(use_seg)
+
+        if bool(getattr(self.renderer, "use_segmentation_colors", False)):
+            pcd = getattr(self.renderer, "pcd", None)
+            has_seg = pcd is not None and getattr(pcd, "segmentation_labels", None) is not None
+            if not has_seg:
+                imgui.same_line()
+                imgui.text_disabled("(waiting for SoftGroup output)")
+
         self.renderer.Render()
         avail = imgui.get_content_region_avail()
         target_w, target_h = max(self.min_w, int(avail.x)), max(self.min_h, int(avail.y))

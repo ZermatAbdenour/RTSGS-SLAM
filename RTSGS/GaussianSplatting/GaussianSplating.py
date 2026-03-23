@@ -204,14 +204,14 @@ class GaussianSplatting:
         if self.pcd.all_points is None:
             return
 
-        attrs = ["all_points", "all_sh", "all_scales", "all_quaternions", "all_alpha"]
+        attrs = [ "all_sh", "all_scales", "all_quaternions", "all_alpha"]
         for attr in attrs:
             val = getattr(self.pcd, attr)
             if not isinstance(val, torch.nn.Parameter):
                 setattr(self.pcd, attr, torch.nn.Parameter(val.detach().requires_grad_(True)))
 
+        #{'params': [self.pcd.all_points], 'lr': self.base_lr * self.points_lr_mult, "name": "points"},
         params = [
-            {'params': [self.pcd.all_points], 'lr': self.base_lr * self.points_lr_mult, "name": "points"},
             {'params': [self.pcd.all_sh], 'lr': self.base_lr * 3.0, "name": "sh"},
             {'params': [self.pcd.all_scales], 'lr': self.base_lr * 3.0, "name": "scales"},
             {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 1.0, "name": "quats"},

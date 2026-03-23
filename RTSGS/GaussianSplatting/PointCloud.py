@@ -53,6 +53,14 @@ class PointCloud:
         self.all_quaternions = None
         self.all_alpha = None
 
+        # Segmentation outputs (aligned 1:1 with all_points).
+        self.segmentation_labels = None
+        self.segmentation_colors = None
+        self.segmentation_color_logits = None
+        self.segmentation_instances = []
+        self.segmentation_metadata = {}
+        self.segmentation_version = 0
+
         # Voxel Packing
         self._pack_offset = int(config.get("pack_offset", 1_000_000))
         self._pack_base = 2 * self._pack_offset + 1
@@ -233,5 +241,62 @@ class PointCloud:
                 self.all_quaternions = torch.cat([self.all_quaternions, new_data[3]])
                 self.all_alpha = torch.cat([self.all_alpha, new_data[4]])
 
+            # Keep segmentation buffers aligned after map growth.
+            if self.segmentation_labels is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.segmentation_labels = torch.cat(
+                        [
+                            self.segmentation_labels,
+                            torch.full((num_new,), -1, dtype=torch.long, device=self.device),
+                        ],
+                        dim=0,
+                    )
+            if self.segmentation_colors is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.segmentation_colors = torch.cat(
+                        [
+                            self.segmentation_colors,
+                            torch.zeros((num_new, 3), dtype=torch.float32, device=self.device),
+                        ],
+                        dim=0,
+                    )
+            if self.segmentation_color_logits is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.segmentation_color_logits = torch.cat(
+                        [
+                            self.segmentation_color_logits,
+                            torch.zeros((num_new, 3), dtype=torch.float32, device=self.device),
+                        ],
+                        dim=0,
+                    )
+
     def get_map(self):
         return self.all_points, self.all_sh, self.all_scales, self.all_quaternions, self.all_alpha
+
+    def set_segmentation_result(
+        self,
+        labels_np,
+        colors_np,
+        color_logits_np,
+        pred_instances=None,
+        metadata=None,
+    ):
+        with self.lock:
+            labels_t = torch.from_numpy(np.asarray(labels_np, dtype=np.int64)).to(self.device)
+            colors_t = torch.from_numpy(np.asarray(colors_np, dtype=np.float32)).to(self.device)
+            logits_t = torch.from_numpy(np.asarray(color_logits_np, dtype=np.float32)).to(self.device)
+
+            n_map = 0 if self.all_points is None else int(self.all_points.shape[0])
+            if n_map > 0 and labels_t.shape[0] != n_map:
+                return False
+
+            self.segmentation_labels = labels_t
+            self.segmentation_colors = colors_t
+            self.segmentation_color_logits = logits_t
+            self.segmentation_instances = list(pred_instances) if pred_instances is not None else []
+            self.segmentation_metadata = dict(metadata) if metadata is not None else {}
+            self.segmentation_version += 1
+            return True

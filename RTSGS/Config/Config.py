@@ -39,6 +39,22 @@ class Config:
             self.config_dict.setdefault("gs_depth_huber_delta", 0.05)
             self.config_dict.setdefault("use_rendered_depth_icp", True)
 
+            # Periodic SoftGroup segmentation.
+            self.config_dict.setdefault("softgroup_enabled", True)
+            self.config_dict.setdefault("softgroup_interval_sec", 5.0)
+            self.config_dict.setdefault("softgroup_min_points", 5000)
+            self.config_dict.setdefault("softgroup_max_points", 180000)
+            self.config_dict.setdefault("softgroup_min_confidence", 0.1)
+            self.config_dict.setdefault("softgroup_fast_mode", True)
+            self.config_dict.setdefault(
+                "softgroup_config",
+                "ThirdParty/SoftGroup/configs/softgroup/softgroup_scannet.yaml",
+            )
+            self.config_dict.setdefault(
+                "softgroup_checkpoint",
+                "Prototype/softgroup_scannet_spconv2.pth",
+            )
+
     def get_rgb_intrinsics(self):
         return np.array(
             [[self.config_dict['rgb_fx'], 0, self.config_dict['rgb_cx']],

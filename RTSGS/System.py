@@ -1,9 +1,11 @@
 import threading
+import os
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GUI.WindowManager import WindowManager
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.DataLoader.DataLoader import DataLoader
 from RTSGS.Tracker.Tracker import Tracker
+from RTSGS.Segmentation.SoftGroupSegmenter import SoftGroupPeriodicSegmenter
 
 import cv2
 import numpy as np
@@ -37,12 +39,16 @@ class RTSGSSystem:
             title="RTSGS System",
         )
 
+        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+        self.segmenter = SoftGroupPeriodicSegmenter(self.pcd, config, project_root)
+
         # Track the last keyframe index added to the map
         self.last_added_keyframe_idx = -1
 
 
     def run(self):
         self._worker.start()
+        self.segmenter.start()
 
         while not self.window.window_should_close():
             self.window.start_frame()
@@ -85,6 +91,7 @@ class RTSGSSystem:
             self._stop = True
             self._cv.notify_all()
 
+        self.segmenter.stop()
         self._worker.join(timeout=1.0)
         self.window.shutdown()
 
