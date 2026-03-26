@@ -49,6 +49,10 @@ class Config:
             self.config_dict.setdefault("semantic_decay_factor", 0.98)
             self.config_dict.setdefault("semantic_min_confidence", 0.2)
             self.config_dict.setdefault("semantic_ema_alpha", 1.0)
+            self.config_dict.setdefault("semantic_depth_tolerance_m", 0.08)
+            self.config_dict.setdefault("semantic_cull_near", 0.05)
+            self.config_dict.setdefault("semantic_cull_far", 50.0)
+            self.config_dict.setdefault("semantic_cull_pad_px", 2.0)
 
     def get_rgb_intrinsics(self):
         return np.array(

@@ -341,6 +341,7 @@ class PointCloud:
         gaussian_indices: torch.Tensor,
         class_ids: torch.Tensor,
         confidences: torch.Tensor,
+        visible_gaussian_indices: torch.Tensor | None = None,
         class_names=None,
         class_palette=None,
         metadata=None,
@@ -364,6 +365,15 @@ class PointCloud:
             conf = conf[valid]
 
             detected_mask = torch.zeros((n_map,), dtype=torch.bool, device=self.device)
+            visible_mask = torch.zeros((n_map,), dtype=torch.bool, device=self.device)
+
+            if visible_gaussian_indices is not None:
+                vis_idx = visible_gaussian_indices.to(self.device, dtype=torch.long).reshape(-1)
+                vis_idx = vis_idx[(vis_idx >= 0) & (vis_idx < n_map)]
+                if vis_idx.numel() > 0:
+                    visible_mask[vis_idx] = True
+            else:
+                visible_mask[:] = True
 
             if idx.numel() > 0:
                 order = torch.argsort(conf, descending=True)
@@ -400,7 +410,7 @@ class PointCloud:
 
             if n_map > 0:
                 decay_factor = float(np.clip(self.semantic_decay_factor, 0.0, 1.0))
-                self.semantic_confidence[~detected_mask] *= decay_factor
+                self.semantic_confidence[visible_mask & (~detected_mask)] *= decay_factor
 
             min_conf = float(max(0.0, self.semantic_min_confidence))
             low = self.semantic_confidence < min_conf

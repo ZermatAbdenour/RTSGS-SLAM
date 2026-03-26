@@ -5,6 +5,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from ultralytics import YOLO
+from RTSGS.GaussianSplatting.GaussianSplating import _build_K, frustum_cull_mask
 
 
 class YOLOSemanticSegmenter:
@@ -19,6 +20,10 @@ class YOLOSemanticSegmenter:
         self.max_detections = int(config.get("yolo_max_detections", 64))
         self.max_points_per_detection = int(config.get("yolo_max_points_per_detection", 8000))
         self.semantic_voxel_size = float(config.get("semantic_voxel_size", config.get("voxel_size", 0.02)))
+        self.semantic_depth_tolerance_m = float(config.get("semantic_depth_tolerance_m", 0.08))
+        self.cull_near = float(config.get("semantic_cull_near", 0.05))
+        self.cull_far = float(config.get("semantic_cull_far", 50.0))
+        self.cull_pad_px = float(config.get("semantic_cull_pad_px", 2.0))
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device_str = "cuda:0" if self.device.type == "cuda" else "cpu"
@@ -126,7 +131,12 @@ class YOLOSemanticSegmenter:
         self._cache_num_points = n
         return n
 
-    def _match_points_to_gaussians(self, points_world: torch.Tensor) -> torch.Tensor:
+    def _match_points_to_gaussians(
+        self,
+        points_world: torch.Tensor,
+        observed_depth: torch.Tensor | None = None,
+        gauss_depth_cam: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         if points_world.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=self.device)
         if self._gauss_keys_sorted is None or self._gauss_first_idx_sorted is None:
@@ -141,7 +151,15 @@ class YOLOSemanticSegmenter:
         valid[in_range] = self._gauss_keys_sorted[pos[in_range]] == q_keys[in_range]
         if not torch.any(valid):
             return torch.empty((0,), dtype=torch.long, device=self.device)
-        return self._gauss_first_idx_sorted[pos[valid]]
+        matched_idx = self._gauss_first_idx_sorted[pos[valid]]
+
+        if observed_depth is not None and gauss_depth_cam is not None:
+            z_obs = observed_depth[valid]
+            z_g = gauss_depth_cam[matched_idx]
+            depth_ok = torch.abs(z_g - z_obs) <= float(self.semantic_depth_tolerance_m)
+            matched_idx = matched_idx[depth_ok]
+
+        return matched_idx
 
     @torch.inference_mode()
     def process_frame(self, rgb_bgr: np.ndarray, depth_raw: np.ndarray, pose_w: np.ndarray | None):
@@ -156,6 +174,12 @@ class YOLOSemanticSegmenter:
         if n_map <= 0:
             return
 
+        with self.pcd.lock:
+            means = self.pcd.all_points
+
+        if means is None or int(means.shape[0]) == 0:
+            return
+
         t0 = time.perf_counter()
         yolo_results = self._model.predict(
             source=rgb_bgr,
@@ -166,11 +190,70 @@ class YOLOSemanticSegmenter:
         )
         infer_ms = (time.perf_counter() - t0) * 1000.0
 
+        pose_t = torch.from_numpy(np.asarray(pose_w, dtype=np.float32)).to(self.device)
+        T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        T_fix[:3, :3] = self.pcd.R_fix
+        viewmat = torch.inverse(T_fix @ pose_t).unsqueeze(0)
+
+        K_depth = _build_K(
+            fx=float(self.pcd.fx),
+            fy=float(self.pcd.fy),
+            cx=float(self.pcd.cx),
+            cy=float(self.pcd.cy),
+            device=self.device,
+        ).unsqueeze(0)
+
+        depth_t = torch.from_numpy(np.asarray(depth_raw)).to(self.device, dtype=torch.float32)
+        depth_t = depth_t / float(self.pcd.depth_scale)
+        h_d, w_d = depth_t.shape[:2]
+        h_r, w_r = rgb_bgr.shape[:2]
+
+        in_frustum = frustum_cull_mask(
+            means_world=means,
+            viewmats=viewmat,
+            Ks=K_depth,
+            width=w_d,
+            height=h_d,
+            near=self.cull_near,
+            far=self.cull_far,
+            pad=self.cull_pad_px,
+        )
+
+        # Keep only Gaussians that are actually visible at the measured depth.
+        visible_idx = torch.where(in_frustum)[0]
+        gauss_depth_cam = torch.full((n_map,), float("inf"), dtype=torch.float32, device=self.device)
+        visible_depth_idx = torch.empty((0,), dtype=torch.long, device=self.device)
+        if visible_idx.numel() > 0:
+            Pw = means[visible_idx]
+            Pw_h = torch.cat([Pw, torch.ones((Pw.shape[0], 1), device=self.device, dtype=Pw.dtype)], dim=1)
+            Pc = Pw_h @ viewmat[0].T
+            X, Y, Z = Pc[:, 0], Pc[:, 1], Pc[:, 2]
+
+            in_z = Z > 1e-6
+            u = self.pcd.fx * (X / Z.clamp_min(1e-12)) + self.pcd.cx
+            v = self.pcd.fy * (Y / Z.clamp_min(1e-12)) + self.pcd.cy
+            ui = torch.round(u).to(torch.long)
+            vi = torch.round(v).to(torch.long)
+            in_img = (ui >= 0) & (ui < w_d) & (vi >= 0) & (vi < h_d)
+
+            keep = in_z & in_img
+            if torch.any(keep):
+                vis_k = visible_idx[keep]
+                z_k = Z[keep]
+                d_k = depth_t[vi[keep], ui[keep]]
+                d_ok = torch.isfinite(d_k) & (d_k > 0)
+                close = torch.abs(z_k - d_k) <= float(self.semantic_depth_tolerance_m)
+                depth_visible = d_ok & close
+                if torch.any(depth_visible):
+                    visible_depth_idx = vis_k[depth_visible]
+                    gauss_depth_cam[visible_depth_idx] = z_k[depth_visible]
+
         if len(yolo_results) == 0:
             self.pcd.fuse_semantic_observations(
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_depth_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
@@ -185,6 +268,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_depth_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
@@ -200,16 +284,12 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_depth_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
             )
             return
-
-        depth_t = torch.from_numpy(np.asarray(depth_raw)).to(self.device, dtype=torch.float32)
-        depth_t = depth_t / float(self.pcd.depth_scale)
-        h_d, w_d = depth_t.shape[:2]
-        h_r, w_r = rgb_bgr.shape[:2]
 
         if int(mask_data.shape[1]) != h_r or int(mask_data.shape[2]) != w_r:
             mask_data = F.interpolate(mask_data.unsqueeze(1), size=(h_r, w_r), mode="nearest").squeeze(1)
@@ -223,6 +303,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_depth_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
@@ -245,6 +326,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_depth_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
@@ -265,6 +347,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_depth_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
@@ -275,7 +358,6 @@ class YOLOSemanticSegmenter:
         ui = ui[in_img]
         vi = vi[in_img]
 
-        pose_t = torch.from_numpy(np.asarray(pose_w, dtype=np.float32)).to(self.device)
         R_corr = self.pcd.R_fix @ pose_t[:3, :3]
         t_corr = (self.pcd.R_fix @ pose_t[:3, 3].unsqueeze(-1)).squeeze(-1)
         points_world = (R_corr @ points_d.T).T + t_corr
@@ -295,7 +377,8 @@ class YOLOSemanticSegmenter:
                 step = max(1, int(sel.numel() // self.max_points_per_detection))
                 sel = sel[::step]
             pts_sel = points_world[sel]
-            g_idx = self._match_points_to_gaussians(pts_sel)
+            z_sel = points_d[sel, 2]
+            g_idx = self._match_points_to_gaussians(pts_sel, observed_depth=z_sel, gauss_depth_cam=gauss_depth_cam)
             if g_idx.numel() == 0:
                 continue
 
@@ -318,6 +401,7 @@ class YOLOSemanticSegmenter:
             idx_t,
             cls_t,
             conf_t,
+            visible_gaussian_indices=visible_depth_idx,
             class_names=self._names,
             class_palette=self._palette_t,
             metadata={

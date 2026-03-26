@@ -42,6 +42,7 @@ class RTSGSSystem:
 
         # Track the last keyframe index added to the map
         self.last_added_keyframe_idx = -1
+        self.last_segmented_keyframe_idx = -1
 
 
     def run(self):
@@ -63,6 +64,14 @@ class RTSGSSystem:
             next_kf = self.last_added_keyframe_idx + 1
             
             if next_kf < self.dataset.current_keyframe_index:
+                if next_kf > self.last_segmented_keyframe_idx:
+                    self.segmenter.process_frame(
+                        self.dataset.rgb_keyframes[next_kf],
+                        self.dataset.depth_keyframes[next_kf],
+                        self.tracker.keyframes_poses[next_kf],
+                    )
+                    self.last_segmented_keyframe_idx = next_kf
+
                 rendered_depth_kf = None
                 if hasattr(self.tracker, "keyframes_rendered_depth_m"):
                     kf_rendered = getattr(self.tracker, "keyframes_rendered_depth_m")
@@ -128,10 +137,7 @@ class RTSGSSystem:
             try:
                 # The tracker updates dataset.current_keyframe_index internally 
                 # when a new keyframe is detected.
-                pose = self.tracker.track_frame(img, depth)
-                if pose is None and hasattr(self.tracker, "poses") and len(self.tracker.poses) > 0:
-                    pose = self.tracker.poses[-1]
-                self.segmenter.process_frame(img, depth, pose)
+                self.tracker.track_frame(img, depth)
             finally:
                 with self._cv:
                     self._busy = False
