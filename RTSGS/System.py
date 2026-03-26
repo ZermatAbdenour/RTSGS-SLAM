@@ -5,12 +5,10 @@ from RTSGS.GUI.WindowManager import WindowManager
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.DataLoader.DataLoader import DataLoader
 from RTSGS.Tracker.Tracker import Tracker
-from RTSGS.Segmentation.SoftGroupSegmenter import SoftGroupPeriodicSegmenter
+from RTSGS.Segmentation.YOLOSegmenter import YOLOSemanticSegmenter
 
 import cv2
 import numpy as np
-import torch
-import torch.nn.functional as F
 
 class RTSGSSystem:
     def __init__(self, dataset: DataLoader, tracker: Tracker, config):
@@ -40,7 +38,7 @@ class RTSGSSystem:
         )
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
-        self.segmenter = SoftGroupPeriodicSegmenter(self.pcd, config, project_root)
+        self.segmenter = YOLOSemanticSegmenter(self.pcd, config, project_root)
 
         # Track the last keyframe index added to the map
         self.last_added_keyframe_idx = -1
@@ -130,7 +128,10 @@ class RTSGSSystem:
             try:
                 # The tracker updates dataset.current_keyframe_index internally 
                 # when a new keyframe is detected.
-                self.tracker.track_frame(img, depth)
+                pose = self.tracker.track_frame(img, depth)
+                if pose is None and hasattr(self.tracker, "poses") and len(self.tracker.poses) > 0:
+                    pose = self.tracker.poses[-1]
+                self.segmenter.process_frame(img, depth, pose)
             finally:
                 with self._cv:
                     self._busy = False

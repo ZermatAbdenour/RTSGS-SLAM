@@ -39,21 +39,16 @@ class Config:
             self.config_dict.setdefault("gs_depth_huber_delta", 0.05)
             self.config_dict.setdefault("use_rendered_depth_icp", True)
 
-            # Periodic SoftGroup segmentation.
-            self.config_dict.setdefault("softgroup_enabled", True)
-            self.config_dict.setdefault("softgroup_interval_sec", 5.0)
-            self.config_dict.setdefault("softgroup_min_points", 5000)
-            self.config_dict.setdefault("softgroup_max_points", 180000)
-            self.config_dict.setdefault("softgroup_min_confidence", 0.1)
-            self.config_dict.setdefault("softgroup_fast_mode", True)
-            self.config_dict.setdefault(
-                "softgroup_config",
-                "ThirdParty/SoftGroup/configs/softgroup/softgroup_scannet.yaml",
-            )
-            self.config_dict.setdefault(
-                "softgroup_checkpoint",
-                "Prototype/softgroup_scannet_spconv2.pth",
-            )
+            # Per-frame YOLO instance-segmentation semantic fusion.
+            self.config_dict.setdefault("yolo_segmentation_enabled", True)
+            self.config_dict.setdefault("yolo_model_path", "Models/yolo26x-seg.pt")
+            self.config_dict.setdefault("yolo_min_confidence", 0.25)
+            self.config_dict.setdefault("yolo_max_detections", 64)
+            self.config_dict.setdefault("yolo_max_points_per_detection", 8000)
+            self.config_dict.setdefault("semantic_voxel_size", self.config_dict.get("voxel_size", 0.05))
+            self.config_dict.setdefault("semantic_decay_factor", 0.98)
+            self.config_dict.setdefault("semantic_min_confidence", 0.2)
+            self.config_dict.setdefault("semantic_ema_alpha", 1.0)
 
     def get_rgb_intrinsics(self):
         return np.array(

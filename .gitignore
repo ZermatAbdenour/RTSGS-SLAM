@@ -222,3 +222,4 @@ requirements.txt
 data/
 .vscode/
 logs/
+Models/

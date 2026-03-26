@@ -1,3 +1,3 @@
-from RTSGS.Segmentation.SoftGroupSegmenter import SoftGroupPeriodicSegmenter
+from RTSGS.Segmentation.YOLOSegmenter import YOLOSemanticSegmenter
 
-__all__ = ["SoftGroupPeriodicSegmenter"]
+__all__ = ["YOLOSemanticSegmenter"]

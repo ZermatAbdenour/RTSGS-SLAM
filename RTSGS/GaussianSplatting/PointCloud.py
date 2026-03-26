@@ -57,9 +57,13 @@ class PointCloud:
         self.segmentation_labels = None
         self.segmentation_colors = None
         self.segmentation_color_logits = None
+        self.semantic_confidence = None
         self.segmentation_instances = []
         self.segmentation_metadata = {}
         self.segmentation_version = 0
+        self.semantic_decay_factor = float(config.get("semantic_decay_factor", 0.98))
+        self.semantic_min_confidence = float(config.get("semantic_min_confidence", 0.2))
+        self.semantic_ema_alpha = float(config.get("semantic_ema_alpha", 1.0))
 
         # Voxel Packing
         self._pack_offset = int(config.get("pack_offset", 1_000_000))
@@ -272,6 +276,16 @@ class PointCloud:
                         ],
                         dim=0,
                     )
+            if self.semantic_confidence is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.semantic_confidence = torch.cat(
+                        [
+                            self.semantic_confidence,
+                            torch.zeros((num_new,), dtype=torch.float32, device=self.device),
+                        ],
+                        dim=0,
+                    )
 
     def get_map(self):
         return self.all_points, self.all_sh, self.all_scales, self.all_quaternions, self.all_alpha
@@ -296,7 +310,143 @@ class PointCloud:
             self.segmentation_labels = labels_t
             self.segmentation_colors = colors_t
             self.segmentation_color_logits = logits_t
+            self.semantic_confidence = torch.where(labels_t >= 0, torch.ones_like(labels_t, dtype=torch.float32), torch.zeros_like(labels_t, dtype=torch.float32))
             self.segmentation_instances = list(pred_instances) if pred_instances is not None else []
             self.segmentation_metadata = dict(metadata) if metadata is not None else {}
+            self.segmentation_version += 1
+            return True
+
+    @staticmethod
+    def _encode_colors_for_shader_torch(rgb_01: torch.Tensor) -> torch.Tensor:
+        c = torch.clamp(rgb_01, 1e-3, 1.0 - 1e-3)
+        logits = torch.log(c / (1.0 - c))
+        encoded = torch.empty_like(logits)
+        encoded[:, 0] = logits[:, 2]
+        encoded[:, 1] = logits[:, 1]
+        encoded[:, 2] = logits[:, 0]
+        return encoded
+
+    def _ensure_semantic_buffers(self, n_map: int):
+        if self.segmentation_labels is None or int(self.segmentation_labels.shape[0]) != n_map:
+            self.segmentation_labels = torch.full((n_map,), -1, dtype=torch.long, device=self.device)
+        if self.semantic_confidence is None or int(self.semantic_confidence.shape[0]) != n_map:
+            self.semantic_confidence = torch.zeros((n_map,), dtype=torch.float32, device=self.device)
+        if self.segmentation_colors is None or int(self.segmentation_colors.shape[0]) != n_map:
+            self.segmentation_colors = torch.zeros((n_map, 3), dtype=torch.float32, device=self.device)
+        if self.segmentation_color_logits is None or int(self.segmentation_color_logits.shape[0]) != n_map:
+            self.segmentation_color_logits = torch.zeros((n_map, 3), dtype=torch.float32, device=self.device)
+
+    def fuse_semantic_observations(
+        self,
+        gaussian_indices: torch.Tensor,
+        class_ids: torch.Tensor,
+        confidences: torch.Tensor,
+        class_names=None,
+        class_palette=None,
+        metadata=None,
+        pred_instances=None,
+    ):
+        with self.lock:
+            n_map = 0 if self.all_points is None else int(self.all_points.shape[0])
+            if n_map <= 0:
+                return False
+
+            self._ensure_semantic_buffers(n_map)
+
+            idx = gaussian_indices.to(self.device, dtype=torch.long).reshape(-1)
+            cls = class_ids.to(self.device, dtype=torch.long).reshape(-1)
+            conf = confidences.to(self.device, dtype=torch.float32).reshape(-1)
+            conf = torch.clamp(conf, 0.0, 1.0)
+
+            valid = (idx >= 0) & (idx < n_map)
+            idx = idx[valid]
+            cls = cls[valid]
+            conf = conf[valid]
+
+            detected_mask = torch.zeros((n_map,), dtype=torch.bool, device=self.device)
+
+            if idx.numel() > 0:
+                order = torch.argsort(conf, descending=True)
+                idx = idx[order]
+                cls = cls[order]
+                conf = conf[order]
+
+                keep = torch.ones_like(idx, dtype=torch.bool)
+                if idx.numel() > 1:
+                    keep[1:] = idx[1:] != idx[:-1]
+
+                idx = idx[keep]
+                cls = cls[keep]
+                conf = conf[keep]
+
+                old_cls = self.segmentation_labels[idx]
+                old_conf = self.semantic_confidence[idx]
+
+                ema_alpha = float(np.clip(self.semantic_ema_alpha, 0.0, 1.0))
+                obs_conf = ema_alpha * conf + (1.0 - ema_alpha) * old_conf
+
+                same_cls = old_cls == cls
+                reinforced = old_conf + obs_conf * (1.0 - old_conf)
+
+                penalized = old_conf * (1.0 - obs_conf)
+                switched = obs_conf > penalized
+
+                new_cls = torch.where(same_cls | switched, cls, old_cls)
+                new_conf = torch.where(same_cls, reinforced, torch.where(switched, obs_conf, penalized))
+
+                self.segmentation_labels[idx] = new_cls
+                self.semantic_confidence[idx] = torch.clamp(new_conf, 0.0, 1.0)
+                detected_mask[idx] = True
+
+            if n_map > 0:
+                decay_factor = float(np.clip(self.semantic_decay_factor, 0.0, 1.0))
+                self.semantic_confidence[~detected_mask] *= decay_factor
+
+            min_conf = float(max(0.0, self.semantic_min_confidence))
+            low = self.semantic_confidence < min_conf
+            self.segmentation_labels[low] = -1
+            self.semantic_confidence[low] = 0.0
+
+            if class_palette is None:
+                n_classes = int(max(1, (torch.max(self.segmentation_labels).item() + 1) if torch.any(self.segmentation_labels >= 0) else 1))
+                g = torch.Generator(device=self.device)
+                g.manual_seed(123)
+                palette_t = torch.rand((n_classes, 3), generator=g, device=self.device, dtype=torch.float32) * 0.85 + 0.1
+            else:
+                if isinstance(class_palette, torch.Tensor):
+                    palette_t = class_palette.to(self.device, dtype=torch.float32)
+                else:
+                    palette_t = torch.from_numpy(np.asarray(class_palette, dtype=np.float32)).to(self.device)
+                if palette_t.ndim != 2 or palette_t.shape[1] != 3:
+                    palette_t = torch.zeros((1, 3), dtype=torch.float32, device=self.device)
+
+            colors = torch.zeros((n_map, 3), dtype=torch.float32, device=self.device)
+            valid_cls = self.segmentation_labels >= 0
+            if torch.any(valid_cls):
+                safe_cls = torch.clamp(self.segmentation_labels[valid_cls], 0, int(palette_t.shape[0]) - 1)
+                base = palette_t[safe_cls]
+                conf_w = self.semantic_confidence[valid_cls].unsqueeze(1)
+                colors[valid_cls] = base * conf_w
+
+            logits = self._encode_colors_for_shader_torch(colors)
+
+            self.segmentation_colors = colors
+            self.segmentation_color_logits = logits
+            self.segmentation_instances = list(pred_instances) if pred_instances is not None else []
+
+            md = dict(self.segmentation_metadata) if isinstance(self.segmentation_metadata, dict) else {}
+            if metadata is not None:
+                md.update(dict(metadata))
+
+            if class_names is not None:
+                md["class_names"] = [str(x) for x in class_names]
+            if palette_t is not None:
+                md["class_palette"] = palette_t.detach().cpu().numpy().tolist()
+
+            md["num_points_total"] = int(n_map)
+            md["num_points_segmented"] = int(torch.count_nonzero(valid_cls).item())
+            md["num_classes_present"] = int(torch.unique(self.segmentation_labels[valid_cls]).numel()) if torch.any(valid_cls) else 0
+
+            self.segmentation_metadata = md
             self.segmentation_version += 1
             return True

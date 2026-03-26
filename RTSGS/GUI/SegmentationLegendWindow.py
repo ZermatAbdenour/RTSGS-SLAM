@@ -44,7 +44,7 @@ class SegmentationLegendWindow:
 
         if len(class_names) == 0 or class_palette.size == 0:
             imgui.separator()
-            imgui.text_disabled("No class-color mapping yet. Wait for SoftGroup periodic output.")
+            imgui.text_disabled("No class-color mapping yet. Wait for YOLO semantic output.")
             imgui.end()
             return
 

@@ -36,7 +36,7 @@ class ViewportWindow:
             has_seg = pcd is not None and getattr(pcd, "segmentation_labels", None) is not None
             if not has_seg:
                 imgui.same_line()
-                imgui.text_disabled("(waiting for SoftGroup output)")
+                imgui.text_disabled("(waiting for YOLO semantic output)")
 
         self.renderer.Render()
         avail = imgui.get_content_region_avail()
