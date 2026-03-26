@@ -43,8 +43,10 @@ class Renderer:
         self._pose_dirty = True
 
         self.use_segmentation_colors = False
+        self.segmentation_class_filter = None
         self._last_color_mode = False
         self._last_segmentation_version = -1
+        self._last_segmentation_filter = None
 
         # Opengl 
         # Enable depth testing for 3D points
@@ -340,6 +342,26 @@ class Renderer:
     def set_use_segmentation_colors(self, enabled: bool):
         self.use_segmentation_colors = bool(enabled)
 
+    def set_segmentation_class_filter(self, class_id):
+        if class_id is None:
+            self.segmentation_class_filter = None
+            return
+
+        if isinstance(class_id, (list, tuple, set)):
+            filt = set()
+            for v in class_id:
+                try:
+                    filt.add(int(v))
+                except Exception:
+                    continue
+            self.segmentation_class_filter = filt if len(filt) > 0 else None
+            return
+
+        try:
+            self.segmentation_class_filter = {int(class_id)}
+        except Exception:
+            self.segmentation_class_filter = None
+
     def update_vbo(self, positions, color_coeffs):
         # The arguments passed from render_pcd
         # are already detached/referenced under the lock there.
@@ -380,31 +402,46 @@ class Renderer:
             if self.pcd.all_points is None or self.pcd.all_sh is None:
                 return
 
-            current_count = self.pcd.all_points.shape[0]
+            points_to_draw = self.pcd.all_points
             seg_version = int(getattr(self.pcd, "segmentation_version", 0))
             use_seg = bool(self.use_segmentation_colors)
+            seg_filter = self.segmentation_class_filter
+            seg_filter_key = tuple(sorted(seg_filter)) if seg_filter else None
 
             color_coeffs = self.pcd.all_sh[:, 0, :]
             if use_seg:
                 seg_logits = getattr(self.pcd, "segmentation_color_logits", None)
-                if seg_logits is not None and int(seg_logits.shape[0]) == int(current_count):
+                if seg_logits is not None and int(seg_logits.shape[0]) == int(points_to_draw.shape[0]):
                     color_coeffs = seg_logits
+
+            if seg_filter:
+                seg_labels = getattr(self.pcd, "segmentation_labels", None)
+                if seg_labels is not None and int(seg_labels.shape[0]) == int(points_to_draw.shape[0]):
+                    keep = torch.zeros_like(seg_labels, dtype=torch.bool)
+                    for cls_id in seg_filter:
+                        keep |= (seg_labels == int(cls_id))
+                    points_to_draw = points_to_draw[keep]
+                    color_coeffs = color_coeffs[keep]
+
+            current_count = int(points_to_draw.shape[0])
             
             # 2. Check if we need to update the OpenGL buffers
             # Only run the heavy upload if the point count changed
             if not self._initialized:
                 self._initialize_pcd_rendering()
-                self.update_vbo(self.pcd.all_points, color_coeffs)
+                self.update_vbo(points_to_draw, color_coeffs)
             elif (
                 self.pcd_added_size != current_count
                 or self._last_color_mode != use_seg
                 or (use_seg and self._last_segmentation_version != seg_version)
+                or self._last_segmentation_filter != seg_filter_key
             ):
                 # We pass the tensors directly while inside the lock
-                self.update_vbo(self.pcd.all_points, color_coeffs)
+                self.update_vbo(points_to_draw, color_coeffs)
 
             self._last_color_mode = use_seg
             self._last_segmentation_version = seg_version
+            self._last_segmentation_filter = seg_filter_key
 
         # 3. Standard OpenGL Drawing (Outside the lock to keep it fast)
         res.simple_shader.use()

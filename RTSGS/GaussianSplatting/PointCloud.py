@@ -408,9 +408,11 @@ class PointCloud:
                 self.semantic_confidence[idx] = torch.clamp(new_conf, 0.0, 1.0)
                 detected_mask[idx] = True
 
+            # Instant forgetting: visible points not detected this frame are immediately unlabeled.
             if n_map > 0:
-                decay_factor = float(np.clip(self.semantic_decay_factor, 0.0, 1.0))
-                self.semantic_confidence[visible_mask & (~detected_mask)] *= decay_factor
+                unseen_visible = visible_mask & (~detected_mask)
+                self.segmentation_labels[unseen_visible] = -1
+                self.semantic_confidence[unseen_visible] = 0.0
 
             min_conf = float(max(0.0, self.semantic_min_confidence))
             low = self.semantic_confidence < min_conf

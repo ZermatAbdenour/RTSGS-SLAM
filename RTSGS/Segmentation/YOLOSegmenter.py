@@ -35,7 +35,7 @@ class YOLOSemanticSegmenter:
 
         self._cache_num_points = -1
         self._gauss_keys_sorted = None
-        self._gauss_first_idx_sorted = None
+        self._gauss_idx_sorted = None
 
     def _abs_path(self, p: str) -> str:
         if os.path.isabs(p):
@@ -106,28 +106,17 @@ class YOLOSemanticSegmenter:
         if n <= 0 or points is None:
             self._cache_num_points = -1
             self._gauss_keys_sorted = None
-            self._gauss_first_idx_sorted = None
+            self._gauss_idx_sorted = None
             return n
 
-        if self._cache_num_points == n and self._gauss_keys_sorted is not None and self._gauss_first_idx_sorted is not None:
+        if self._cache_num_points == n and self._gauss_keys_sorted is not None and self._gauss_idx_sorted is not None:
             return n
 
         vox = torch.floor(points / self.semantic_voxel_size).to(torch.int64)
         keys = self.pcd._pack_voxels(vox)
-        unique_keys, inv = torch.unique(keys, return_inverse=True)
-
-        first_idx = torch.full((unique_keys.shape[0],), n, dtype=torch.long, device=self.device)
-        first_idx.scatter_reduce_(
-            0,
-            inv,
-            torch.arange(n, device=self.device, dtype=torch.long),
-            reduce="amin",
-            include_self=False,
-        )
-
-        order = torch.argsort(unique_keys)
-        self._gauss_keys_sorted = unique_keys[order]
-        self._gauss_first_idx_sorted = first_idx[order]
+        order = torch.argsort(keys)
+        self._gauss_keys_sorted = keys[order]
+        self._gauss_idx_sorted = torch.arange(n, device=self.device, dtype=torch.long)[order]
         self._cache_num_points = n
         return n
 
@@ -139,27 +128,54 @@ class YOLOSemanticSegmenter:
     ) -> torch.Tensor:
         if points_world.numel() == 0:
             return torch.empty((0,), dtype=torch.long, device=self.device)
-        if self._gauss_keys_sorted is None or self._gauss_first_idx_sorted is None:
+        if self._gauss_keys_sorted is None or self._gauss_idx_sorted is None:
             return torch.empty((0,), dtype=torch.long, device=self.device)
 
         vox = torch.floor(points_world / self.semantic_voxel_size).to(torch.int64)
         q_keys = self.pcd._pack_voxels(vox)
 
-        pos = torch.searchsorted(self._gauss_keys_sorted, q_keys)
-        in_range = pos < self._gauss_keys_sorted.shape[0]
-        valid = in_range.clone()
-        valid[in_range] = self._gauss_keys_sorted[pos[in_range]] == q_keys[in_range]
-        if not torch.any(valid):
+        q_unique, q_inv = torch.unique(q_keys, return_inverse=True)
+        left = torch.searchsorted(self._gauss_keys_sorted, q_unique, right=False)
+        right = torch.searchsorted(self._gauss_keys_sorted, q_unique, right=True)
+
+        matched_chunks = []
+        use_depth_gate = observed_depth is not None and gauss_depth_cam is not None
+        tol = float(self.semantic_depth_tolerance_m)
+
+        for i in range(int(q_unique.shape[0])):
+            li = int(left[i].item())
+            ri = int(right[i].item())
+            if ri <= li:
+                continue
+
+            cand_idx = self._gauss_idx_sorted[li:ri]
+            if cand_idx.numel() == 0:
+                continue
+
+            if use_depth_gate:
+                z_obs_i = observed_depth[q_inv == i]
+                if z_obs_i.numel() == 0:
+                    continue
+
+                z_g = gauss_depth_cam[cand_idx]
+                valid_z = torch.isfinite(z_g)
+                if not torch.any(valid_z):
+                    continue
+
+                cand_idx = cand_idx[valid_z]
+                z_g = z_g[valid_z]
+                dz = torch.abs(z_g[:, None] - z_obs_i[None, :])
+                keep = torch.amin(dz, dim=1) <= tol
+                cand_idx = cand_idx[keep]
+                if cand_idx.numel() == 0:
+                    continue
+
+            matched_chunks.append(cand_idx)
+
+        if len(matched_chunks) == 0:
             return torch.empty((0,), dtype=torch.long, device=self.device)
-        matched_idx = self._gauss_first_idx_sorted[pos[valid]]
 
-        if observed_depth is not None and gauss_depth_cam is not None:
-            z_obs = observed_depth[valid]
-            z_g = gauss_depth_cam[matched_idx]
-            depth_ok = torch.abs(z_g - z_obs) <= float(self.semantic_depth_tolerance_m)
-            matched_idx = matched_idx[depth_ok]
-
-        return matched_idx
+        return torch.unique(torch.cat(matched_chunks, dim=0))
 
     @torch.inference_mode()
     def process_frame(self, rgb_bgr: np.ndarray, depth_raw: np.ndarray, pose_w: np.ndarray | None):
@@ -373,16 +389,19 @@ class YOLOSemanticSegmenter:
                 continue
 
             sel = torch.where(m)[0]
-            if sel.numel() > self.max_points_per_detection:
-                step = max(1, int(sel.numel() // self.max_points_per_detection))
-                sel = sel[::step]
-            pts_sel = points_world[sel]
-            z_sel = points_d[sel, 2]
-            g_idx = self._match_points_to_gaussians(pts_sel, observed_depth=z_sel, gauss_depth_cam=gauss_depth_cam)
-            if g_idx.numel() == 0:
+            g_parts = []
+            chunk_size = max(1, int(self.max_points_per_detection))
+            for sel_chunk in torch.split(sel, chunk_size):
+                pts_sel = points_world[sel_chunk]
+                z_sel = points_d[sel_chunk, 2]
+                g_idx_chunk = self._match_points_to_gaussians(pts_sel, observed_depth=z_sel, gauss_depth_cam=gauss_depth_cam)
+                if g_idx_chunk.numel() > 0:
+                    g_parts.append(g_idx_chunk)
+
+            if len(g_parts) == 0:
                 continue
 
-            g_idx = torch.unique(g_idx)
+            g_idx = torch.unique(torch.cat(g_parts, dim=0))
             obs_idx.append(g_idx)
             obs_cls.append(torch.full_like(g_idx, int(cls_ids[det_i].item()), dtype=torch.long, device=self.device))
             obs_conf.append(torch.full_like(g_idx, float(confs[det_i].item()), dtype=torch.float32, device=self.device))

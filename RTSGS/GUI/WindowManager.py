@@ -68,7 +68,7 @@ class WindowManager:
         self.opengl_renderer = Renderer(point_cloud, camera, tracker=tracker, dataset=dataset)
         self.viewport_window = ViewportWindow(self.opengl_renderer)
         self.gaussian_splating_window = GaussianSplattingWindow(point_cloud,camera)
-        self.segmentation_legend_window = SegmentationLegendWindow(point_cloud)
+        self.segmentation_legend_window = SegmentationLegendWindow(point_cloud, self.opengl_renderer)
         #time
         self._last_time = None
         self._delta_time = 0.016
