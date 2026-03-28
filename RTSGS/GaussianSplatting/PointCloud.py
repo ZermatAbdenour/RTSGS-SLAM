@@ -81,6 +81,11 @@ class PointCloud:
         self.executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
         self.is_processing = False
         self.lock = threading.Lock()
+        self.rendered_depth_provider = None
+
+    def set_rendered_depth_provider(self, provider):
+        """Set callable provider: provider(pose_4x4_np) -> depth_m (H,W) or None."""
+        self.rendered_depth_provider = provider
         
     def _pack_voxels(self, vox_xyz: torch.Tensor) -> torch.Tensor:
         off, base = self._pack_offset, self._pack_base
@@ -151,9 +156,21 @@ class PointCloud:
         z_raw = depth.reshape(-1)
         mask = z_raw > 0
 
-        # Optionally skip points that are too close to the last rendered depth.
-        if rendered_depth_np is not None:
-            rendered_depth = torch.from_numpy(np.asarray(rendered_depth_np)).to(self.device).float()
+        # Prefer a fresh rendered depth from the current keyframe pose.
+        rendered_depth_src = None
+        if self.rendered_depth_provider is not None:
+            try:
+                rendered_depth_src = self.rendered_depth_provider(np.asarray(pose_np, dtype=np.float32))
+            except Exception:
+                rendered_depth_src = None
+
+        # Backward-compatible fallback if no provider is set.
+        if rendered_depth_src is None:
+            rendered_depth_src = rendered_depth_np
+
+        # Optionally skip points that are too close to the rendered depth.
+        if rendered_depth_src is not None:
+            rendered_depth = torch.from_numpy(np.asarray(rendered_depth_src)).to(self.device).float()
             if rendered_depth.shape == depth.shape:
                 rendered_raw = rendered_depth.reshape(-1)
                 rendered_valid = torch.isfinite(rendered_raw) & (rendered_raw > 0)

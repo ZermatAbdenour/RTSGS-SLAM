@@ -32,6 +32,8 @@ class RTSGSSystem:
         self.gs = GaussianSplatting(self.pcd, self.dataset, self.tracker)
         if hasattr(self.tracker, "set_rendered_depth_provider"):
             self.tracker.set_rendered_depth_provider(self.gs.render_depth_at_pose)
+        if hasattr(self.pcd, "set_rendered_depth_provider"):
+            self.pcd.set_rendered_depth_provider(self.gs.render_depth_at_pose)
         self.window = WindowManager(
             self.pcd,
             self.gs,
@@ -69,17 +71,11 @@ class RTSGSSystem:
             next_kf = self.last_added_keyframe_idx + 1
             
             if next_kf < self.dataset.current_keyframe_index:
-                rendered_depth_kf = None
-                if hasattr(self.tracker, "keyframes_rendered_depth_m"):
-                    kf_rendered = getattr(self.tracker, "keyframes_rendered_depth_m")
-                    if next_kf < len(kf_rendered):
-                        rendered_depth_kf = kf_rendered[next_kf]
-
                 success = self.pcd.update_async(
                     self.dataset.rgb_keyframes[next_kf],
                     self.dataset.depth_keyframes[next_kf],
                     self.tracker.keyframes_poses[next_kf],
-                    rendered_depth_kf,
+                    None,
                 )
                      
                 if success:

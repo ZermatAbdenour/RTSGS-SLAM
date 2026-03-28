@@ -98,7 +98,7 @@ def frustum_cull_mask(
 
 
 class GaussianSplatting:
-    def __init__(self, pcd, dataset, tracker, learning_rate=1e-3, max_steps_per_sec=100, downsample_factor=1.0):
+    def __init__(self, pcd, dataset, tracker, learning_rate=4e-4, max_steps_per_sec=1000, downsample_factor=1.0):
         self.pcd = pcd
         self.dataset = dataset
         self.device = pcd.device
@@ -121,7 +121,7 @@ class GaussianSplatting:
         self.depth_huber_delta = float(self.tracker.config.get('gs_depth_huber_delta', 0.05))
 
         # Token-bucket limiter: smooth "max_steps_per_sec"
-        self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=2.0)
+        self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=100.0)
 
         self.densify_start_iter = 100
         self.densify_interval = 300
@@ -204,6 +204,9 @@ class GaussianSplatting:
         if self.pcd.all_points is None:
             return
 
+        old_optimizer = self.optimizer
+        old_num_points = int(self.num_points_optimized)
+
         attrs = ["all_points","all_sh", "all_scales", "all_quaternions", "all_alpha"]
         for attr in attrs:
             val = getattr(self.pcd, attr)
@@ -219,9 +222,59 @@ class GaussianSplatting:
         ]
         self.optimizer = torch.optim.Adam(params)
 
+        # Preserve Adam momentum for pre-existing gaussians when the map grows.
+        if old_optimizer is not None:
+            old_groups = {g.get("name", f"g{i}"): g for i, g in enumerate(old_optimizer.param_groups)}
+            for i, new_group in enumerate(self.optimizer.param_groups):
+                gname = new_group.get("name", f"g{i}")
+                old_group = old_groups.get(gname)
+                if old_group is None or len(old_group.get("params", [])) == 0:
+                    continue
+                if len(new_group.get("params", [])) == 0:
+                    continue
+
+                old_param = old_group["params"][0]
+                new_param = new_group["params"][0]
+
+                old_state = old_optimizer.state.get(old_param, None)
+                if old_state is None:
+                    continue
+
+                new_state = self.optimizer.state[new_param]
+
+                if "step" in old_state:
+                    old_step = old_state["step"]
+                    new_state["step"] = old_step.clone() if torch.is_tensor(old_step) else old_step
+
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    old_tensor = old_state.get(key, None)
+                    if old_tensor is None or (not torch.is_tensor(old_tensor)):
+                        continue
+
+                    new_tensor = torch.zeros_like(new_param.data)
+
+                    if old_tensor.shape == new_tensor.shape:
+                        new_tensor.copy_(old_tensor)
+                    elif old_tensor.ndim == new_tensor.ndim and old_tensor.ndim > 0 and old_tensor.shape[1:] == new_tensor.shape[1:]:
+                        n_copy = min(int(old_tensor.shape[0]), int(new_tensor.shape[0]))
+                        if n_copy > 0:
+                            new_tensor[:n_copy].copy_(old_tensor[:n_copy])
+
+                    new_state[key] = new_tensor
+
         self.num_points_optimized = self.pcd.all_points.shape[0]
-        self.xys_grad_norm = torch.zeros(self.num_points_optimized, device=self.device)
-        self.vis_counts = torch.zeros(self.num_points_optimized, device=self.device)
+        if self.xys_grad_norm is None or self.vis_counts is None:
+            self.xys_grad_norm = torch.zeros(self.num_points_optimized, device=self.device)
+            self.vis_counts = torch.zeros(self.num_points_optimized, device=self.device)
+        else:
+            new_grad_norm = torch.zeros(self.num_points_optimized, device=self.device)
+            new_vis_counts = torch.zeros(self.num_points_optimized, device=self.device)
+            n_copy = min(old_num_points, self.num_points_optimized)
+            if n_copy > 0:
+                new_grad_norm[:n_copy] = self.xys_grad_norm[:n_copy]
+                new_vis_counts[:n_copy] = self.vis_counts[:n_copy]
+            self.xys_grad_norm = new_grad_norm
+            self.vis_counts = new_vis_counts
 
     def densify(self):
         avg_grads = self.xys_grad_norm / (self.vis_counts + 1e-7)
