@@ -27,19 +27,19 @@ if __name__ == "__main__":
     #data = TUMDataLoader(os.path.join(data_path, "rgb"), os.path.join(data_path, "depth"),trajectory_path)
 
     # Replica
-    #data_path = "./Datasets/Replica/ThirdParty/Replica/room1/results"
-    #trajectory_path = "./Datasets/Replica/ThirdParty/Replica/room1/traj.txt"
-    #data = ReplicaDataLoader(data_path=data_path,trajectory_path=trajectory_path)
+    data_path = "./Datasets/Replica/ThirdParty/Replica/room1/results"
+    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/room1/traj.txt"
+    data = ReplicaDataLoader(data_path=data_path,trajectory_path=trajectory_path)
 
     # ScanNet
-    scene_extracted_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted"
-    trajectory_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted/pose"
-    config = ScanNetConfig()
-    data = ScanNetDataLoader(scene_extracted_path, config, trajectory_path=trajectory_path)
+    #scene_extracted_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted"
+    #trajectory_path = "./Datasets/ScanNet/data/scans/scene0000_00/extracted/pose"
+    #config = ScanNetConfig()
+    #data = ScanNetDataLoader(scene_extracted_path, config, trajectory_path=trajectory_path)
 
     #config = Config()
     #config = ReplicaConfig()
-    config = ScanNetConfig()
+    config = ReplicaConfig()
     print("Loading Data...")
     
     data.load_data(1000)

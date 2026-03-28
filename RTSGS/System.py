@@ -1,5 +1,6 @@
 import threading
 import os
+from collections import deque
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GUI.WindowManager import WindowManager
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
@@ -21,6 +22,10 @@ class RTSGSSystem:
 
         self._cv = threading.Condition()
         self._worker = threading.Thread(target=self._worker_loop, daemon=True)
+        self._seg_cv = threading.Condition()
+        self._seg_stop = False
+        self._seg_pending = deque()
+        self._seg_worker = threading.Thread(target=self._segmenter_loop, daemon=True)
 
         # Define the point cloud and GS engine
         self.pcd = PointCloud(config)
@@ -46,6 +51,7 @@ class RTSGSSystem:
 
     def run(self):
         self._worker.start()
+        self._seg_worker.start()
         self.segmenter.start()
 
         while not self.window.window_should_close():
@@ -77,12 +83,16 @@ class RTSGSSystem:
                 )
                      
                 if success:
-                    # Trigger semantic fusion exactly when this keyframe projection is accepted.
-                    self.segmenter.process_frame(
-                        self.dataset.rgb_keyframes[next_kf],
-                        self.dataset.depth_keyframes[next_kf],
-                        self.tracker.keyframes_poses[next_kf],
-                    )
+                    # Queue semantic fusion asynchronously in the segmenter worker.
+                    with self._seg_cv:
+                        self._seg_pending.append(
+                            (
+                                self.dataset.rgb_keyframes[next_kf],
+                                self.dataset.depth_keyframes[next_kf],
+                                self.tracker.keyframes_poses[next_kf],
+                            )
+                        )
+                        self._seg_cv.notify()
                     print(f"Update triggered for keyframe: {next_kf}")
                     self.last_added_keyframe_idx = next_kf
 
@@ -95,8 +105,13 @@ class RTSGSSystem:
             self._stop = True
             self._cv.notify_all()
 
-        self.segmenter.stop()
+        with self._seg_cv:
+            self._seg_stop = True
+            self._seg_cv.notify_all()
+
         self._worker.join(timeout=1.0)
+        self._seg_worker.join(timeout=1.0)
+        self.segmenter.stop()
         self.window.shutdown()
 
     def process_stream_frame(self):
@@ -138,3 +153,19 @@ class RTSGSSystem:
             finally:
                 with self._cv:
                     self._busy = False
+
+    def _segmenter_loop(self):
+        while True:
+            with self._seg_cv:
+                while not self._seg_stop and len(self._seg_pending) == 0:
+                    self._seg_cv.wait()
+
+                if self._seg_stop and len(self._seg_pending) == 0:
+                    return
+
+                rgb, depth, pose = self._seg_pending.popleft()
+
+            try:
+                self.segmenter.process_frame(rgb, depth, pose)
+            except Exception as e:
+                print(f"Segmenter worker error: {e}")
