@@ -16,11 +16,17 @@ class YOLOSemanticSegmenter:
 
         self.enabled = bool(config.get("yolo_segmentation_enabled", True))
         self.model_path = self._abs_path(str(config.get("yolo_model_path", "Models/yolo26x-seg.pt")))
-        self.min_confidence = float(config.get("yolo_min_confidence", 0.25))
+        self.min_confidence = float(config.get("yolo_min_confidence", 0.6))
+        self.assignment_confidence_gate = float(config.get("semantic_assignment_min_confidence", 0.6))
         self.max_detections = int(config.get("yolo_max_detections", 64))
         self.max_points_per_detection = int(config.get("yolo_max_points_per_detection", 8000))
         self.semantic_voxel_size = float(config.get("semantic_voxel_size", config.get("voxel_size", 0.02)))
-        self.semantic_depth_tolerance_m = float(config.get("semantic_depth_tolerance_m", 0.08))
+        self.semantic_depth_tolerance_m = float(config.get("semantic_depth_tolerance_m", 0.04))
+        self.semantic_mask_threshold = float(config.get("semantic_mask_threshold", 0.5))
+        self.semantic_mask_erode_px = int(config.get("semantic_mask_erode_px", 10))
+        self.semantic_mask_pad_px = int(config.get("semantic_mask_pad_px", 0))
+        self.semantic_depth_edge_reject_enabled = bool(config.get("semantic_depth_edge_reject_enabled", True))
+        self.semantic_depth_edge_threshold_m = float(config.get("semantic_depth_edge_threshold_m", 0.05))
         self.cull_near = float(config.get("semantic_cull_near", 0.05))
         self.cull_far = float(config.get("semantic_cull_far", 50.0))
         self.cull_pad_px = float(config.get("semantic_cull_pad_px", 2.0))
@@ -97,6 +103,69 @@ class YOLOSemanticSegmenter:
         )
         self._grid_cache[key] = (u.reshape(-1), v.reshape(-1))
         return self._grid_cache[key]
+
+    def _update_debug_image(self, img_bgr: np.ndarray | None):
+        if img_bgr is None:
+            return
+        try:
+            img = np.asarray(img_bgr, dtype=np.uint8)
+            if img.ndim != 3 or img.shape[2] != 3:
+                return
+            if not img.flags["C_CONTIGUOUS"]:
+                img = np.ascontiguousarray(img)
+            with self.pcd.lock:
+                self.pcd.segmentation_debug_image_bgr = img.copy()
+                self.pcd.segmentation_debug_timestamp = time.time()
+        except Exception:
+            return
+
+    def _erode_mask_bool(self, mask_bool: torch.Tensor) -> torch.Tensor:
+        r = max(0, int(self.semantic_mask_erode_px))
+        if r <= 0 or mask_bool.numel() == 0:
+            return mask_bool
+
+        # Binary erosion via max-pooling the inverted mask.
+        k = 2 * r + 1
+        x = mask_bool.to(dtype=torch.float32).unsqueeze(1)
+        eroded = 1.0 - F.max_pool2d(1.0 - x, kernel_size=k, stride=1, padding=r)
+        return eroded.squeeze(1) > 0.5
+
+    def _depth_edge_mask(self, depth_m: torch.Tensor) -> torch.Tensor:
+        if depth_m.numel() == 0:
+            return torch.zeros_like(depth_m, dtype=torch.bool)
+
+        d = depth_m
+        valid = torch.isfinite(d) & (d > 0)
+        thr = float(self.semantic_depth_edge_threshold_m)
+
+        edge = torch.zeros_like(d, dtype=torch.bool)
+
+        if d.shape[1] > 1:
+            pair_valid_x = valid[:, 1:] & valid[:, :-1]
+            gx = torch.abs(d[:, 1:] - d[:, :-1])
+            ex = pair_valid_x & (gx > thr)
+            edge[:, 1:] |= ex
+            edge[:, :-1] |= ex
+
+        if d.shape[0] > 1:
+            pair_valid_y = valid[1:, :] & valid[:-1, :]
+            gy = torch.abs(d[1:, :] - d[:-1, :])
+            ey = pair_valid_y & (gy > thr)
+            edge[1:, :] |= ey
+            edge[:-1, :] |= ey
+
+        return edge
+
+    def _dilate_mask_bool(self, mask_bool: torch.Tensor) -> torch.Tensor:
+        r = max(0, int(self.semantic_mask_pad_px))
+        if r <= 0 or mask_bool.numel() == 0:
+            return mask_bool
+
+        # Binary dilation expands mask support around edges by r pixels.
+        k = 2 * r + 1
+        x = mask_bool.to(dtype=torch.float32).unsqueeze(1)
+        dilated = F.max_pool2d(x, kernel_size=k, stride=1, padding=r)
+        return dilated.squeeze(1) > 0.5
 
     def _prepare_gaussian_lookup(self):
         with self.pcd.lock:
@@ -200,11 +269,22 @@ class YOLOSemanticSegmenter:
         yolo_results = self._model.predict(
             source=rgb_bgr,
             verbose=False,
-            conf=self.min_confidence,
+            # Keep detector confidence configurable, then apply semantic assignment gate below.
+            conf=float(np.clip(self.min_confidence, 0.0, 1.0)),
             max_det=self.max_detections,
             device=self.device_str,
         )
         infer_ms = (time.perf_counter() - t0) * 1000.0
+
+        debug_img_bgr = np.asarray(rgb_bgr, dtype=np.uint8)
+        if len(yolo_results) > 0:
+            try:
+                plotted = yolo_results[0].plot()
+                if plotted is not None:
+                    debug_img_bgr = np.asarray(plotted, dtype=np.uint8)
+            except Exception:
+                pass
+        self._update_debug_image(debug_img_bgr)
 
         pose_t = torch.from_numpy(np.asarray(pose_w, dtype=np.float32)).to(self.device)
         T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
@@ -269,7 +349,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
-                visible_gaussian_indices=visible_depth_idx,
+                visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
@@ -284,7 +364,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
-                visible_gaussian_indices=visible_depth_idx,
+                visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
@@ -295,12 +375,36 @@ class YOLOSemanticSegmenter:
         confs = boxes.conf.to(self.device, dtype=torch.float32)
         mask_data = masks.data.to(self.device, dtype=torch.float32)
 
+        # Strict independent assignment gate after YOLO output.
+        det_keep = confs >= float(self.assignment_confidence_gate)
+        n_low_conf_discarded = int(torch.count_nonzero(~det_keep).item())
+        if torch.any(det_keep):
+            cls_ids = cls_ids[det_keep]
+            confs = confs[det_keep]
+            mask_data = mask_data[det_keep]
+        else:
+            self.pcd.fuse_semantic_observations(
+                torch.empty((0,), dtype=torch.long, device=self.device),
+                torch.empty((0,), dtype=torch.long, device=self.device),
+                torch.empty((0,), dtype=torch.float32, device=self.device),
+                visible_gaussian_indices=visible_idx,
+                class_names=self._names,
+                class_palette=self._palette_t,
+                metadata={
+                    "inference_ms": float(infer_ms),
+                    "num_detections": 0,
+                    "assignment_confidence_gate": float(self.assignment_confidence_gate),
+                    "low_conf_detections_discarded": int(n_low_conf_discarded),
+                },
+            )
+            return
+
         if cls_ids.numel() == 0 or mask_data.shape[0] == 0:
             self.pcd.fuse_semantic_observations(
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
-                visible_gaussian_indices=visible_depth_idx,
+                visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
@@ -309,17 +413,22 @@ class YOLOSemanticSegmenter:
 
         if int(mask_data.shape[1]) != h_r or int(mask_data.shape[2]) != w_r:
             mask_data = F.interpolate(mask_data.unsqueeze(1), size=(h_r, w_r), mode="nearest").squeeze(1)
-        mask_bool = mask_data > 0.5
+        mask_bool = mask_data > float(np.clip(self.semantic_mask_threshold, 0.0, 1.0))
+        mask_bool = self._erode_mask_bool(mask_bool)
+        mask_bool = self._dilate_mask_bool(mask_bool)
+
+        depth_edge = self._depth_edge_mask(depth_t) if self.semantic_depth_edge_reject_enabled else torch.zeros_like(depth_t, dtype=torch.bool)
 
         u_d, v_d = self._get_depth_grid(h_d, w_d)
         z = depth_t.reshape(-1)
+        depth_edge_flat = depth_edge.reshape(-1)
         valid_d = torch.isfinite(z) & (z > 0)
         if not torch.any(valid_d):
             self.pcd.fuse_semantic_observations(
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
-                visible_gaussian_indices=visible_depth_idx,
+                visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
@@ -329,6 +438,7 @@ class YOLOSemanticSegmenter:
         z = z[valid_d]
         u_d = u_d[valid_d]
         v_d = v_d[valid_d]
+        depth_edge_flat = depth_edge_flat[valid_d]
 
         x = (u_d - self.pcd.cx) * z / self.pcd.fx
         y = (v_d - self.pcd.cy) * z / self.pcd.fy
@@ -342,7 +452,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
-                visible_gaussian_indices=visible_depth_idx,
+                visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
@@ -351,6 +461,7 @@ class YOLOSemanticSegmenter:
 
         points_d = points_d[valid_rgb]
         z_rgb = z_rgb[valid_rgb]
+        depth_edge_flat = depth_edge_flat[valid_rgb]
 
         u_rgb = self.pcd.rgb_fx * (points_rgb[valid_rgb, 0] / z_rgb) + self.pcd.rgb_cx
         v_rgb = self.pcd.rgb_fy * (points_rgb[valid_rgb, 1] / z_rgb) + self.pcd.rgb_cy
@@ -363,7 +474,7 @@ class YOLOSemanticSegmenter:
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.long, device=self.device),
                 torch.empty((0,), dtype=torch.float32, device=self.device),
-                visible_gaussian_indices=visible_depth_idx,
+                visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
@@ -373,6 +484,7 @@ class YOLOSemanticSegmenter:
         points_d = points_d[in_img]
         ui = ui[in_img]
         vi = vi[in_img]
+        depth_edge_flat = depth_edge_flat[in_img]
 
         R_corr = self.pcd.R_fix @ pose_t[:3, :3]
         t_corr = (self.pcd.R_fix @ pose_t[:3, 3].unsqueeze(-1)).squeeze(-1)
@@ -384,7 +496,10 @@ class YOLOSemanticSegmenter:
 
         order = torch.argsort(confs, descending=True)
         for det_i in order.tolist():
-            m = mask_bool[det_i, vi, ui]
+            if float(confs[det_i].item()) < float(self.assignment_confidence_gate):
+                continue
+
+            m = mask_bool[det_i, vi, ui] & (~depth_edge_flat)
             if not torch.any(m):
                 continue
 
@@ -415,12 +530,19 @@ class YOLOSemanticSegmenter:
             cls_t = torch.cat(obs_cls, dim=0)
             conf_t = torch.cat(obs_conf, dim=0)
 
+        # Final safety gate before fusion.
+        if conf_t.numel() > 0:
+            keep_final = conf_t >= float(self.assignment_confidence_gate)
+            idx_t = idx_t[keep_final]
+            cls_t = cls_t[keep_final]
+            conf_t = conf_t[keep_final]
+
         total_ms = (time.perf_counter() - t0) * 1000.0
         self.pcd.fuse_semantic_observations(
             idx_t,
             cls_t,
             conf_t,
-            visible_gaussian_indices=visible_depth_idx,
+            visible_gaussian_indices=visible_idx,
             class_names=self._names,
             class_palette=self._palette_t,
             metadata={
@@ -429,5 +551,7 @@ class YOLOSemanticSegmenter:
                 "total_ms": float(total_ms),
                 "num_detections": int(cls_ids.numel()),
                 "num_gaussians_observed": int(idx_t.numel()),
+                "assignment_confidence_gate": float(self.assignment_confidence_gate),
+                "low_conf_detections_discarded": int(n_low_conf_discarded),
             },
         )

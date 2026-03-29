@@ -2,17 +2,20 @@ from __future__ import annotations
 
 import numpy as np
 from imgui_bundle import imgui
+from RTSGS.GUI.ImageWidget import ImageWidget
 
 
 class SegmentationLegendWindow:
-    def __init__(self, pcd, renderer=None, title: str = "Segmentation Legend"):
+    def __init__(self, pcd, renderer=None, title: str = "Segmentation"):
         self.pcd = pcd
         self.renderer = renderer
         self.title = title
         self.is_open = False
         self.only_present_classes = True
+        self.show_segmented_image = True
         self.class_enabled = {}
         self._last_applied_filter = object()
+        self._img_widget = None
 
     def _sync_class_flags(self, class_count: int):
         existing = set(self.class_enabled.keys())
@@ -63,6 +66,8 @@ class SegmentationLegendWindow:
         with self.pcd.lock:
             metadata = dict(getattr(self.pcd, "segmentation_metadata", {}) or {})
             labels_t = getattr(self.pcd, "segmentation_labels", None)
+            dbg_img = getattr(self.pcd, "segmentation_debug_image_bgr", None)
+            dbg_ts = float(getattr(self.pcd, "segmentation_debug_timestamp", 0.0))
 
         class_names = list(metadata.get("class_names", []))
         class_palette = np.asarray(metadata.get("class_palette", []), dtype=np.float32)
@@ -91,6 +96,22 @@ class SegmentationLegendWindow:
             imgui.text_disabled(
                 f"Last update: t={ts:.1f}, inference={inf_ms:.1f} ms, points={n_seg}/{n_tot}"
             )
+            imgui.separator()
+
+        changed_img, show_img = imgui.checkbox("Show YOLO segmented image", self.show_segmented_image)
+        if changed_img:
+            self.show_segmented_image = bool(show_img)
+
+        if self.show_segmented_image:
+            imgui.text_disabled(f"YOLO image timestamp: {dbg_ts:.3f}")
+            if dbg_img is not None and getattr(dbg_img, "size", 0) > 0:
+                if self._img_widget is None:
+                    self._img_widget = ImageWidget(dbg_img)
+                else:
+                    self._img_widget.set_image_rgb(dbg_img)
+                self._img_widget.draw(fit_to_window=True)
+            else:
+                imgui.text_disabled("No YOLO segmented image available yet.")
             imgui.separator()
 
         n_selected = int(sum(1 for v in self.class_enabled.values() if bool(v)))

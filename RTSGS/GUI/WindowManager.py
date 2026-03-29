@@ -92,7 +92,7 @@ class WindowManager:
                 if clicked:
                     self.viewport_window.is_open = not self.viewport_window.is_open
 
-                clicked, _ = imgui.menu_item("Segmentation Legend", "", self.segmentation_legend_window.is_open, True)
+                clicked, _ = imgui.menu_item("Segmentation", "", self.segmentation_legend_window.is_open, True)
                 if clicked:
                     self.segmentation_legend_window.is_open = not self.segmentation_legend_window.is_open
                 imgui.end_menu()

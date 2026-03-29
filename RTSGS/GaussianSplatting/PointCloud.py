@@ -61,9 +61,12 @@ class PointCloud:
         self.segmentation_instances = []
         self.segmentation_metadata = {}
         self.segmentation_version = 0
-        self.semantic_decay_factor = float(config.get("semantic_decay_factor", 0.98))
-        self.semantic_min_confidence = float(config.get("semantic_min_confidence", 0.2))
+        self.segmentation_debug_image_bgr = None
+        self.segmentation_debug_timestamp = 0.0
+        self.semantic_decay_factor = float(config.get("semantic_decay_factor", 0.2))
+        self.semantic_min_confidence = float(config.get("semantic_min_confidence", 0.35))
         self.semantic_ema_alpha = float(config.get("semantic_ema_alpha", 1.0))
+        self.semantic_assign_min_confidence = float(config.get("yolo_min_confidence", 0.35))
 
         # Voxel Packing
         self._pack_offset = int(config.get("pack_offset", 1_000_000))
@@ -376,6 +379,12 @@ class PointCloud:
             conf = confidences.to(self.device, dtype=torch.float32).reshape(-1)
             conf = torch.clamp(conf, 0.0, 1.0)
 
+            # Hard safety gate: never assign classes below detector confidence floor.
+            keep_conf = conf >= float(self.semantic_assign_min_confidence)
+            idx = idx[keep_conf]
+            cls = cls[keep_conf]
+            conf = conf[keep_conf]
+
             valid = (idx >= 0) & (idx < n_map)
             idx = idx[valid]
             cls = cls[valid]
@@ -390,7 +399,8 @@ class PointCloud:
                 if vis_idx.numel() > 0:
                     visible_mask[vis_idx] = True
             else:
-                visible_mask[:] = True
+                # If frustum visibility is unknown, avoid global forgetting.
+                visible_mask[:] = False
 
             if idx.numel() > 0:
                 order = torch.argsort(conf, descending=True)
@@ -425,11 +435,13 @@ class PointCloud:
                 self.semantic_confidence[idx] = torch.clamp(new_conf, 0.0, 1.0)
                 detected_mask[idx] = True
 
-            # Instant forgetting: visible points not detected this frame are immediately unlabeled.
+            # Temporal consistency: if a labeled point is not classified this frame,
+            # decay its confidence instead of dropping the class immediately.
             if n_map > 0:
-                unseen_visible = visible_mask & (~detected_mask)
-                self.segmentation_labels[unseen_visible] = -1
-                self.semantic_confidence[unseen_visible] = 0.0
+                decay = float(np.clip(self.semantic_decay_factor, 0.0, 1.0))
+                # Forget only points inside current frustum scope.
+                forget_mask = (self.segmentation_labels >= 0) & (~detected_mask) & visible_mask
+                self.semantic_confidence[forget_mask] = self.semantic_confidence[forget_mask] * decay
 
             min_conf = float(max(0.0, self.semantic_min_confidence))
             low = self.semantic_confidence < min_conf
