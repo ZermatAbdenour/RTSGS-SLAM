@@ -352,6 +352,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
             )
             return
@@ -367,6 +368,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
             )
             return
@@ -390,6 +392,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={
                     "inference_ms": float(infer_ms),
                     "num_detections": 0,
@@ -407,6 +410,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
             )
             return
@@ -431,6 +435,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
             )
             return
@@ -455,6 +460,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
             )
             return
@@ -477,6 +483,7 @@ class YOLOSemanticSegmenter:
                 visible_gaussian_indices=visible_idx,
                 class_names=self._names,
                 class_palette=self._palette_t,
+                pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(cls_ids.numel())},
             )
             return
@@ -493,6 +500,7 @@ class YOLOSemanticSegmenter:
         obs_idx = []
         obs_cls = []
         obs_conf = []
+        pred_instances = []
 
         order = torch.argsort(confs, descending=True)
         for det_i in order.tolist():
@@ -520,6 +528,13 @@ class YOLOSemanticSegmenter:
             obs_idx.append(g_idx)
             obs_cls.append(torch.full_like(g_idx, int(cls_ids[det_i].item()), dtype=torch.long, device=self.device))
             obs_conf.append(torch.full_like(g_idx, float(confs[det_i].item()), dtype=torch.float32, device=self.device))
+            pred_instances.append(
+                {
+                    "class_id": int(cls_ids[det_i].item()),
+                    "confidence": float(confs[det_i].item()),
+                    "gaussian_indices": g_idx,
+                }
+            )
 
         if len(obs_idx) == 0:
             idx_t = torch.empty((0,), dtype=torch.long, device=self.device)
@@ -545,6 +560,7 @@ class YOLOSemanticSegmenter:
             visible_gaussian_indices=visible_idx,
             class_names=self._names,
             class_palette=self._palette_t,
+            pred_instances=pred_instances,
             metadata={
                 "timestamp": time.time(),
                 "inference_ms": float(infer_ms),

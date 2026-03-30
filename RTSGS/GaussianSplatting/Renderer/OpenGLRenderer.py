@@ -47,6 +47,13 @@ class Renderer:
         self._last_color_mode = False
         self._last_segmentation_version = -1
         self._last_segmentation_filter = None
+        self.show_instance_bboxes = True
+
+        self.instance_bbox_vao = None
+        self.instance_bbox_vbo = None
+        self.instance_bbox_capacity_bytes = 0
+        self.instance_bbox_vertex_count = 0
+        self._last_instance_bbox_seg_version = -1
 
         # Opengl 
         # Enable depth testing for 3D points
@@ -102,6 +109,127 @@ class Renderer:
 
         glBindVertexArray(0)
         glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def _initialize_instance_bbox_rendering(self):
+        if self.instance_bbox_vao is not None:
+            return
+
+        self.instance_bbox_vbo = glGenBuffers(1)
+        self.instance_bbox_vao = glGenVertexArrays(1)
+
+        glBindVertexArray(self.instance_bbox_vao)
+        glBindBuffer(GL_ARRAY_BUFFER, self.instance_bbox_vbo)
+        glBufferData(GL_ARRAY_BUFFER, 0, None, GL_DYNAMIC_DRAW)
+        glEnableVertexAttribArray(0)
+        glVertexAttribPointer(0, 3, GL_FLOAT, GL_FALSE, 6 * 4, ctypes.c_void_p(0))
+        glEnableVertexAttribArray(1)
+        glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE, 6 * 4, ctypes.c_void_p(12))
+        glBindVertexArray(0)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def _build_instance_bbox_vertices(self, instances, class_palette=None):
+        if not isinstance(instances, list) or len(instances) == 0:
+            return np.empty((0, 6), dtype=np.float32)
+
+        edges = [
+            (0, 1), (1, 2), (2, 3), (3, 0),
+            (4, 5), (5, 6), (6, 7), (7, 4),
+            (0, 4), (1, 5), (2, 6), (3, 7),
+        ]
+
+        verts = []
+        for inst in instances:
+            try:
+                bmin = np.asarray(inst.get("bbox_min", [0.0, 0.0, 0.0]), dtype=np.float32)
+                bmax = np.asarray(inst.get("bbox_max", [0.0, 0.0, 0.0]), dtype=np.float32)
+                if bmin.shape[0] != 3 or bmax.shape[0] != 3:
+                    continue
+
+                x0, y0, z0 = float(bmin[0]), float(bmin[1]), float(bmin[2])
+                x1, y1, z1 = float(bmax[0]), float(bmax[1]), float(bmax[2])
+
+                corners = np.asarray(
+                    [
+                        [x0, y0, z0], [x1, y0, z0], [x1, y1, z0], [x0, y1, z0],
+                        [x0, y0, z1], [x1, y0, z1], [x1, y1, z1], [x0, y1, z1],
+                    ],
+                    dtype=np.float32,
+                )
+
+                cls_id = int(inst.get("class_id", -1))
+                if class_palette is not None and 0 <= cls_id < class_palette.shape[0]:
+                    col = np.asarray(class_palette[cls_id], dtype=np.float32)
+                else:
+                    col = np.asarray([1.0, 1.0, 0.2], dtype=np.float32)
+
+                for a, b in edges:
+                    verts.append(np.concatenate([corners[a], col], axis=0))
+                    verts.append(np.concatenate([corners[b], col], axis=0))
+            except Exception:
+                continue
+
+        if len(verts) == 0:
+            return np.empty((0, 6), dtype=np.float32)
+        return np.asarray(verts, dtype=np.float32)
+
+    def _update_instance_bbox_vbo(self, vertices: np.ndarray):
+        if self.instance_bbox_vao is None:
+            self._initialize_instance_bbox_rendering()
+
+        self.instance_bbox_vertex_count = int(vertices.shape[0])
+        if self.instance_bbox_vertex_count <= 0:
+            return
+
+        bytes_required = int(vertices.nbytes)
+        glBindBuffer(GL_ARRAY_BUFFER, self.instance_bbox_vbo)
+        if bytes_required > self.instance_bbox_capacity_bytes:
+            self.instance_bbox_capacity_bytes = bytes_required
+            glBufferData(GL_ARRAY_BUFFER, self.instance_bbox_capacity_bytes, vertices, GL_DYNAMIC_DRAW)
+        else:
+            glBufferSubData(GL_ARRAY_BUFFER, 0, bytes_required, vertices)
+        glBindBuffer(GL_ARRAY_BUFFER, 0)
+
+    def render_instance_bboxes(self):
+        if not bool(self.show_instance_bboxes):
+            return
+
+        with self.pcd.lock:
+            seg_version = int(getattr(self.pcd, "segmentation_version", 0))
+            instances = list(getattr(self.pcd, "segmentation_instances", []))
+            md = getattr(self.pcd, "segmentation_metadata", {})
+            class_palette = None
+            if isinstance(md, dict) and "class_palette" in md:
+                try:
+                    class_palette = np.asarray(md["class_palette"], dtype=np.float32)
+                except Exception:
+                    class_palette = None
+
+        if seg_version != self._last_instance_bbox_seg_version:
+            vertices = self._build_instance_bbox_vertices(instances, class_palette=class_palette)
+            self._update_instance_bbox_vbo(vertices)
+            self._last_instance_bbox_seg_version = seg_version
+
+        if self.instance_bbox_vertex_count <= 0 or self.instance_bbox_vao is None:
+            return
+
+        self.camera.update_view()
+        res.line_shader.use()
+        glUniformMatrix4fv(
+            glGetUniformLocation(res.line_shader.program, 'u_view'),
+            1,
+            GL_FALSE,
+            self.camera.view,
+        )
+        glUniformMatrix4fv(
+            glGetUniformLocation(res.line_shader.program, 'u_projection'),
+            1,
+            GL_FALSE,
+            self.camera.projection,
+        )
+        glBindVertexArray(self.instance_bbox_vao)
+        glLineWidth(2.0)
+        glDrawArrays(GL_LINES, 0, self.instance_bbox_vertex_count)
+        glBindVertexArray(0)
 
     def _build_pose_overlay_data(self):
         if self.tracker is None:
@@ -342,6 +470,9 @@ class Renderer:
     def set_use_segmentation_colors(self, enabled: bool):
         self.use_segmentation_colors = bool(enabled)
 
+    def set_show_instance_bboxes(self, enabled: bool):
+        self.show_instance_bboxes = bool(enabled)
+
     def set_segmentation_class_filter(self, class_id):
         if class_id is None:
             self.segmentation_class_filter = None
@@ -393,6 +524,7 @@ class Renderer:
         glClearColor(0.08, 0.1, 0.13, 1.0)
         self.render_pcd()
         self.render_keyframe_poses()
+        self.render_instance_bboxes()
         self.fb.unbind()
 
     def render_pcd(self):
@@ -477,6 +609,12 @@ class Renderer:
         if self.pose_traj_vao is not None:
             glDeleteVertexArrays(1, [self.pose_traj_vao])
             self.pose_traj_vao = None
+        if self.instance_bbox_vbo is not None:
+            glDeleteBuffers(1, [self.instance_bbox_vbo])
+            self.instance_bbox_vbo = None
+        if self.instance_bbox_vao is not None:
+            glDeleteVertexArrays(1, [self.instance_bbox_vao])
+            self.instance_bbox_vao = None
 
     def on_resize(self):
         self.camera.update_projection(self.fb)

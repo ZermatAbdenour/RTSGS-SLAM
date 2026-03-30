@@ -58,6 +58,7 @@ class PointCloud:
         self.segmentation_colors = None
         self.segmentation_color_logits = None
         self.semantic_confidence = None
+        self.gaussian_instance_ids = None
         self.segmentation_instances = []
         self.segmentation_metadata = {}
         self.segmentation_version = 0
@@ -67,6 +68,15 @@ class PointCloud:
         self.semantic_min_confidence = float(config.get("semantic_min_confidence", 0.35))
         self.semantic_ema_alpha = float(config.get("semantic_ema_alpha", 1.0))
         self.semantic_assign_min_confidence = float(config.get("yolo_min_confidence", 0.35))
+        self.instance_min_points = int(config.get("instance_min_points", 30))
+        self.instance_iou_gate = float(config.get("instance_iou_gate", 0.15))
+        self.instance_center_gate_m = float(config.get("instance_center_gate_m", 0.30))
+        self.instance_max_missed_frames = int(config.get("instance_max_missed_frames", 30))
+        self.instance_bbox_quantile = float(config.get("instance_bbox_quantile", 0.03))
+        self.instance_bbox_merge_iou = float(config.get("instance_bbox_merge_iou", 0.25))
+        self.instance_bbox_merge_center_gate_m = float(config.get("instance_bbox_merge_center_gate_m", 0.25))
+        self._instance_next_id = 1
+        self._instance_frame_idx = 0
 
         # Voxel Packing
         self._pack_offset = int(config.get("pack_offset", 1_000_000))
@@ -306,6 +316,16 @@ class PointCloud:
                         ],
                         dim=0,
                     )
+            if self.gaussian_instance_ids is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.gaussian_instance_ids = torch.cat(
+                        [
+                            self.gaussian_instance_ids,
+                            torch.full((num_new,), -1, dtype=torch.long, device=self.device),
+                        ],
+                        dim=0,
+                    )
 
     def get_map(self):
         return self.all_points, self.all_sh, self.all_scales, self.all_quaternions, self.all_alpha
@@ -331,7 +351,8 @@ class PointCloud:
             self.segmentation_colors = colors_t
             self.segmentation_color_logits = logits_t
             self.semantic_confidence = torch.where(labels_t >= 0, torch.ones_like(labels_t, dtype=torch.float32), torch.zeros_like(labels_t, dtype=torch.float32))
-            self.segmentation_instances = list(pred_instances) if pred_instances is not None else []
+            if pred_instances is not None:
+                self.segmentation_instances = list(pred_instances)
             self.segmentation_metadata = dict(metadata) if metadata is not None else {}
             self.segmentation_version += 1
             return True
@@ -347,14 +368,288 @@ class PointCloud:
         return encoded
 
     def _ensure_semantic_buffers(self, n_map: int):
-        if self.segmentation_labels is None or int(self.segmentation_labels.shape[0]) != n_map:
-            self.segmentation_labels = torch.full((n_map,), -1, dtype=torch.long, device=self.device)
-        if self.semantic_confidence is None or int(self.semantic_confidence.shape[0]) != n_map:
-            self.semantic_confidence = torch.zeros((n_map,), dtype=torch.float32, device=self.device)
-        if self.segmentation_colors is None or int(self.segmentation_colors.shape[0]) != n_map:
-            self.segmentation_colors = torch.zeros((n_map, 3), dtype=torch.float32, device=self.device)
-        if self.segmentation_color_logits is None or int(self.segmentation_color_logits.shape[0]) != n_map:
-            self.segmentation_color_logits = torch.zeros((n_map, 3), dtype=torch.float32, device=self.device)
+        def _resize_or_init_1d(x, fill_value, dtype):
+            if x is None:
+                return torch.full((n_map,), fill_value, dtype=dtype, device=self.device)
+            cur = int(x.shape[0])
+            if cur == n_map:
+                return x
+            if cur < n_map:
+                tail = torch.full((n_map - cur,), fill_value, dtype=dtype, device=self.device)
+                return torch.cat([x, tail], dim=0)
+            return x[:n_map]
+
+        def _resize_or_init_2d(x, fill_value, dtype):
+            if x is None:
+                return torch.full((n_map, 3), fill_value, dtype=dtype, device=self.device)
+            cur = int(x.shape[0])
+            if cur == n_map:
+                return x
+            if cur < n_map:
+                tail = torch.full((n_map - cur, 3), fill_value, dtype=dtype, device=self.device)
+                return torch.cat([x, tail], dim=0)
+            return x[:n_map]
+
+        self.segmentation_labels = _resize_or_init_1d(self.segmentation_labels, -1, torch.long)
+        self.semantic_confidence = _resize_or_init_1d(self.semantic_confidence, 0.0, torch.float32)
+        self.gaussian_instance_ids = _resize_or_init_1d(self.gaussian_instance_ids, -1, torch.long)
+        self.segmentation_colors = _resize_or_init_2d(self.segmentation_colors, 0.0, torch.float32)
+        self.segmentation_color_logits = _resize_or_init_2d(self.segmentation_color_logits, 0.0, torch.float32)
+
+    def _instance_bbox(self, indices_t: torch.Tensor):
+        if indices_t.numel() == 0 or self.all_points is None:
+            return None
+        pts = self.all_points[indices_t]
+        if pts.numel() == 0:
+            return None
+        q = float(np.clip(self.instance_bbox_quantile, 0.0, 0.2))
+        if q > 0.0 and int(pts.shape[0]) >= 8:
+            lo = torch.tensor(q, device=self.device, dtype=pts.dtype)
+            hi = torch.tensor(1.0 - q, device=self.device, dtype=pts.dtype)
+            bmin = torch.quantile(pts, lo, dim=0)
+            bmax = torch.quantile(pts, hi, dim=0)
+        else:
+            bmin = torch.amin(pts, dim=0)
+            bmax = torch.amax(pts, dim=0)
+        center = 0.5 * (bmin + bmax)
+        return bmin, bmax, center
+
+    @staticmethod
+    def _bbox_iou_3d(a_min, a_max, b_min, b_max) -> float:
+        inter_min = torch.maximum(a_min, b_min)
+        inter_max = torch.minimum(a_max, b_max)
+        inter = torch.clamp(inter_max - inter_min, min=0.0)
+        inter_vol = float((inter[0] * inter[1] * inter[2]).item())
+        if inter_vol <= 0.0:
+            return 0.0
+        va = torch.clamp(a_max - a_min, min=0.0)
+        vb = torch.clamp(b_max - b_min, min=0.0)
+        vol_a = float((va[0] * va[1] * va[2]).item())
+        vol_b = float((vb[0] * vb[1] * vb[2]).item())
+        denom = vol_a + vol_b - inter_vol
+        if denom <= 1e-12:
+            return 0.0
+        return inter_vol / denom
+
+    def _rebuild_instances_snapshot(self):
+        if self.all_points is None or self.gaussian_instance_ids is None:
+            self.segmentation_instances = []
+            return
+
+        out = []
+        ids = torch.unique(self.gaussian_instance_ids)
+        ids = ids[ids >= 0]
+        for inst_id_t in ids:
+            inst_id = int(inst_id_t.item())
+            idx = torch.where(self.gaussian_instance_ids == inst_id_t)[0]
+            if idx.numel() == 0:
+                continue
+            lbl = self.segmentation_labels[idx]
+            valid_lbl = lbl[lbl >= 0]
+            if valid_lbl.numel() == 0:
+                cls_id = -1
+            else:
+                cls_id = int(torch.mode(valid_lbl).values.item())
+
+            box = self._instance_bbox(idx)
+            if box is None:
+                continue
+            bmin, bmax, center = box
+
+            conf = self.semantic_confidence[idx]
+            score = float(torch.mean(conf).item()) if conf.numel() > 0 else 0.0
+
+            out.append(
+                {
+                    "instance_id": inst_id,
+                    "class_id": cls_id,
+                    "num_points": int(idx.numel()),
+                    "score": score,
+                    "bbox_min": bmin.detach().cpu().numpy().tolist(),
+                    "bbox_max": bmax.detach().cpu().numpy().tolist(),
+                    "center": center.detach().cpu().numpy().tolist(),
+                }
+            )
+
+        out.sort(key=lambda x: x["instance_id"])
+        self.segmentation_instances = out
+
+    def _update_instances_from_predictions(self, pred_instances, n_map: int):
+        self._instance_frame_idx += 1
+        frame_idx = int(self._instance_frame_idx)
+
+        if not isinstance(self.segmentation_instances, list):
+            self.segmentation_instances = []
+
+        # Track inactivity for existing instances.
+        by_id = {}
+        for inst in self.segmentation_instances:
+            iid = int(inst.get("instance_id", -1))
+            if iid < 0:
+                continue
+            missed = int(inst.get("missed_frames", 0)) + 1
+            inst["missed_frames"] = missed
+            by_id[iid] = inst
+
+        candidates = pred_instances if isinstance(pred_instances, list) else []
+        for cand in candidates:
+            if not isinstance(cand, dict):
+                continue
+            if "gaussian_indices" not in cand:
+                continue
+
+            idx = cand["gaussian_indices"]
+            if not isinstance(idx, torch.Tensor):
+                idx = torch.as_tensor(idx, device=self.device)
+            idx = idx.to(self.device, dtype=torch.long).reshape(-1)
+            idx = idx[(idx >= 0) & (idx < n_map)]
+            if idx.numel() == 0:
+                continue
+
+            idx = torch.unique(idx)
+            if int(idx.numel()) < int(self.instance_min_points):
+                continue
+
+            cls_id = int(cand.get("class_id", -1))
+            score = float(cand.get("confidence", 0.0))
+
+            box = self._instance_bbox(idx)
+            if box is None:
+                continue
+            bmin, bmax, center = box
+
+            best_id = None
+            best_score = -1.0
+            for inst in self.segmentation_instances:
+                if int(inst.get("class_id", -1)) != cls_id:
+                    continue
+
+                ibmin = torch.tensor(inst.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                ibmax = torch.tensor(inst.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                icenter = torch.tensor(inst.get("center", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+
+                iou = self._bbox_iou_3d(bmin, bmax, ibmin, ibmax)
+                dist = float(torch.linalg.norm(center - icenter).item())
+                if iou >= float(self.instance_iou_gate) or dist <= float(self.instance_center_gate_m):
+                    match_score = iou - 0.05 * dist
+                    if match_score > best_score:
+                        best_score = match_score
+                        best_id = int(inst.get("instance_id", -1))
+
+            if best_id is None or best_id < 0:
+                best_id = int(self._instance_next_id)
+                self._instance_next_id += 1
+                new_inst = {
+                    "instance_id": best_id,
+                    "class_id": cls_id,
+                    "score": score,
+                    "num_points": int(idx.numel()),
+                    "bbox_min": bmin.detach().cpu().numpy().tolist(),
+                    "bbox_max": bmax.detach().cpu().numpy().tolist(),
+                    "center": center.detach().cpu().numpy().tolist(),
+                    "last_seen_frame": frame_idx,
+                    "missed_frames": 0,
+                }
+                self.segmentation_instances.append(new_inst)
+                by_id[best_id] = new_inst
+            else:
+                inst = by_id.get(best_id, None)
+                if inst is None:
+                    continue
+                ibmin = torch.tensor(inst.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                ibmax = torch.tensor(inst.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                new_bmin = torch.minimum(ibmin, bmin)
+                new_bmax = torch.maximum(ibmax, bmax)
+                new_center = 0.5 * (new_bmin + new_bmax)
+
+                inst["bbox_min"] = new_bmin.detach().cpu().numpy().tolist()
+                inst["bbox_max"] = new_bmax.detach().cpu().numpy().tolist()
+                inst["center"] = new_center.detach().cpu().numpy().tolist()
+                inst["score"] = max(float(inst.get("score", 0.0)), score)
+                inst["last_seen_frame"] = frame_idx
+                inst["missed_frames"] = 0
+
+            self.gaussian_instance_ids[idx] = int(best_id)
+
+        # Purge stale instances and release their point assignments.
+        keep = []
+        for inst in self.segmentation_instances:
+            missed = int(inst.get("missed_frames", 0))
+            if missed <= int(self.instance_max_missed_frames):
+                keep.append(inst)
+            else:
+                iid = int(inst.get("instance_id", -1))
+                if iid >= 0 and self.gaussian_instance_ids is not None:
+                    self.gaussian_instance_ids[self.gaussian_instance_ids == iid] = -1
+        self.segmentation_instances = keep
+
+        self._merge_overlapping_instances()
+
+        # Refresh bboxes and counts from current point assignments.
+        self._rebuild_instances_snapshot()
+
+    def _merge_overlapping_instances(self):
+        if self.gaussian_instance_ids is None:
+            return
+        if not isinstance(self.segmentation_instances, list) or len(self.segmentation_instances) < 2:
+            return
+
+        instances = list(self.segmentation_instances)
+        merged_any = True
+        while merged_any:
+            merged_any = False
+            n = len(instances)
+            i = 0
+            while i < n:
+                a = instances[i]
+                j = i + 1
+                while j < n:
+                    b = instances[j]
+                    if int(a.get("class_id", -1)) != int(b.get("class_id", -1)):
+                        j += 1
+                        continue
+
+                    a_min = torch.tensor(a.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                    a_max = torch.tensor(a.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                    b_min = torch.tensor(b.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+                    b_max = torch.tensor(b.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
+
+                    iou = self._bbox_iou_3d(a_min, a_max, b_min, b_max)
+                    a_center = 0.5 * (a_min + a_max)
+                    b_center = 0.5 * (b_min + b_max)
+                    center_dist = float(torch.linalg.norm(a_center - b_center).item())
+
+                    should_merge = (
+                        iou > 0.0
+                        or
+                        iou >= float(self.instance_bbox_merge_iou)
+                        or center_dist <= float(self.instance_bbox_merge_center_gate_m)
+                    )
+                    if not should_merge:
+                        j += 1
+                        continue
+
+                    keep_id = min(int(a.get("instance_id", -1)), int(b.get("instance_id", -1)))
+                    drop_id = max(int(a.get("instance_id", -1)), int(b.get("instance_id", -1)))
+                    if keep_id < 0 or drop_id < 0:
+                        j += 1
+                        continue
+
+                    self.gaussian_instance_ids[self.gaussian_instance_ids == drop_id] = keep_id
+
+                    a["bbox_min"] = torch.minimum(a_min, b_min).detach().cpu().numpy().tolist()
+                    a["bbox_max"] = torch.maximum(a_max, b_max).detach().cpu().numpy().tolist()
+                    a["center"] = (0.5 * (torch.tensor(a["bbox_min"], device=self.device) + torch.tensor(a["bbox_max"], device=self.device))).detach().cpu().numpy().tolist()
+                    a["score"] = max(float(a.get("score", 0.0)), float(b.get("score", 0.0)))
+                    a["missed_frames"] = min(int(a.get("missed_frames", 0)), int(b.get("missed_frames", 0)))
+                    a["last_seen_frame"] = max(int(a.get("last_seen_frame", 0)), int(b.get("last_seen_frame", 0)))
+
+                    instances.pop(j)
+                    n -= 1
+                    merged_any = True
+                i += 1
+
+        self.segmentation_instances = instances
 
     def fuse_semantic_observations(
         self,
@@ -473,7 +768,10 @@ class PointCloud:
 
             self.segmentation_colors = colors
             self.segmentation_color_logits = logits
-            self.segmentation_instances = list(pred_instances) if pred_instances is not None else []
+            if pred_instances is not None:
+                self._update_instances_from_predictions(pred_instances, n_map)
+            elif not isinstance(self.segmentation_instances, list):
+                self.segmentation_instances = []
 
             md = dict(self.segmentation_metadata) if isinstance(self.segmentation_metadata, dict) else {}
             if metadata is not None:
@@ -487,6 +785,7 @@ class PointCloud:
             md["num_points_total"] = int(n_map)
             md["num_points_segmented"] = int(torch.count_nonzero(valid_cls).item())
             md["num_classes_present"] = int(torch.unique(self.segmentation_labels[valid_cls]).numel()) if torch.any(valid_cls) else 0
+            md["num_instances"] = int(len(self.segmentation_instances))
 
             self.segmentation_metadata = md
             self.segmentation_version += 1

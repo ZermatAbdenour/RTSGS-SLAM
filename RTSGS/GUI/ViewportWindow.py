@@ -31,6 +31,13 @@ class ViewportWindow:
         if changed and hasattr(self.renderer, "set_use_segmentation_colors"):
             self.renderer.set_use_segmentation_colors(use_seg)
 
+        changed_bbox, show_bbox = imgui.checkbox(
+            "Show instance bboxes",
+            bool(getattr(self.renderer, "show_instance_bboxes", True)),
+        )
+        if changed_bbox and hasattr(self.renderer, "set_show_instance_bboxes"):
+            self.renderer.set_show_instance_bboxes(show_bbox)
+
         if bool(getattr(self.renderer, "use_segmentation_colors", False)):
             pcd = getattr(self.renderer, "pcd", None)
             has_seg = pcd is not None and getattr(pcd, "segmentation_labels", None) is not None
