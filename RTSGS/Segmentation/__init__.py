@@ -1,3 +1,3 @@
-from RTSGS.Segmentation.YOLOSegmenter import YOLOSemanticSegmenter
+from RTSGS.Segmentation.Segmenter import YOLOSemanticSegmenter
 
 __all__ = ["YOLOSemanticSegmenter"]

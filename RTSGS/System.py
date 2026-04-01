@@ -1,12 +1,13 @@
 import threading
 import os
+import time
 from collections import deque
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GUI.WindowManager import WindowManager
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.DataLoader.DataLoader import DataLoader
 from RTSGS.Tracker.Tracker import Tracker
-from RTSGS.Segmentation.YOLOSegmenter import YOLOSemanticSegmenter
+from RTSGS.Segmentation.Segmenter import YOLOSemanticSegmenter
 
 import cv2
 import numpy as np
@@ -25,6 +26,11 @@ class RTSGSSystem:
         self._seg_cv = threading.Condition()
         self._seg_stop = False
         self._seg_pending = deque()
+        self._seg_busy = False
+        self._seg_last_total_ms = 0.0
+        self._seg_last_kf_index = -1
+        self._seg_processed_count = 0
+        self._seg_last_error = ""
         self._seg_worker = threading.Thread(target=self._segmenter_loop, daemon=True)
 
         # Define the point cloud and GS engine
@@ -47,6 +53,15 @@ class RTSGSSystem:
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.segmenter = YOLOSemanticSegmenter(self.pcd, config, project_root)
 
+        # Segmenter runtime status shown in GUI.
+        with self.pcd.lock:
+            self.pcd.segmentation_worker_busy = False
+            self.pcd.segmentation_queue_size = 0
+            self.pcd.segmentation_processed_count = 0
+            self.pcd.segmentation_last_kf_index = -1
+            self.pcd.segmentation_last_total_ms = 0.0
+            self.pcd.segmentation_last_error = ""
+
         # Track the last keyframe index added to the map
         self.last_added_keyframe_idx = -1
 
@@ -67,30 +82,40 @@ class RTSGSSystem:
             self.gs.training_step()
 
             # 3. Asynchronous Map Update
-            # Process the NEXT pending keyframe (one at a time, in order)
-            next_kf = self.last_added_keyframe_idx + 1
-            
-            if next_kf < self.dataset.current_keyframe_index:
+            # Drain as many pending keyframes as possible without waiting for the next GUI frame.
+            while True:
+                next_kf = self.last_added_keyframe_idx + 1
+                if next_kf >= self.dataset.current_keyframe_index:
+                    break
+
                 success = self.pcd.update_async(
                     self.dataset.rgb_keyframes[next_kf],
                     self.dataset.depth_keyframes[next_kf],
                     self.tracker.keyframes_poses[next_kf],
                     None,
                 )
-                     
-                if success:
-                    # Queue semantic fusion asynchronously in the segmenter worker.
-                    with self._seg_cv:
-                        self._seg_pending.append(
-                            (
-                                self.dataset.rgb_keyframes[next_kf],
-                                self.dataset.depth_keyframes[next_kf],
-                                self.tracker.keyframes_poses[next_kf],
-                            )
+
+                if not success:
+                    break
+
+                # Queue semantic fusion asynchronously in the segmenter worker.
+                with self._seg_cv:
+                    self._seg_pending.append(
+                        (
+                            self.dataset.rgb_keyframes[next_kf],
+                            self.dataset.depth_keyframes[next_kf],
+                            self.tracker.keyframes_poses[next_kf],
+                            int(next_kf),
                         )
-                        self._seg_cv.notify()
-                    print(f"Update triggered for keyframe: {next_kf}")
-                    self.last_added_keyframe_idx = next_kf
+                    )
+                    q_size = int(len(self._seg_pending))
+                    self._seg_cv.notify()
+
+                with self.pcd.lock:
+                    self.pcd.segmentation_queue_size = q_size
+
+                print(f"Update triggered for keyframe: {next_kf}")
+                self.last_added_keyframe_idx = next_kf
 
             # 4. Visualization and GUI
             self.tracker.visualize_tracking()
@@ -159,9 +184,33 @@ class RTSGSSystem:
                 if self._seg_stop and len(self._seg_pending) == 0:
                     return
 
-                rgb, depth, pose = self._seg_pending.popleft()
+                rgb, depth, pose, kf_index = self._seg_pending.popleft()
+                self._seg_busy = True
+                q_size = int(len(self._seg_pending))
+
+            with self.pcd.lock:
+                self.pcd.segmentation_worker_busy = True
+                self.pcd.segmentation_queue_size = q_size
 
             try:
+                t0 = time.perf_counter()
                 self.segmenter.process_frame(rgb, depth, pose)
+                self._seg_last_total_ms = float((time.perf_counter() - t0) * 1000.0)
+                self._seg_last_kf_index = int(kf_index)
+                self._seg_processed_count += 1
+                self._seg_last_error = ""
             except Exception as e:
+                self._seg_last_error = str(e)
                 print(f"Segmenter worker error: {e}")
+            finally:
+                with self._seg_cv:
+                    self._seg_busy = False
+                    q_size = int(len(self._seg_pending))
+
+                with self.pcd.lock:
+                    self.pcd.segmentation_worker_busy = bool(self._seg_busy)
+                    self.pcd.segmentation_queue_size = q_size
+                    self.pcd.segmentation_processed_count = int(self._seg_processed_count)
+                    self.pcd.segmentation_last_kf_index = int(self._seg_last_kf_index)
+                    self.pcd.segmentation_last_total_ms = float(self._seg_last_total_ms)
+                    self.pcd.segmentation_last_error = str(self._seg_last_error)

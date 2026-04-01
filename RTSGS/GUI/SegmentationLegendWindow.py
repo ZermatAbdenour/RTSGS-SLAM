@@ -68,6 +68,21 @@ class SegmentationLegendWindow:
             labels_t = getattr(self.pcd, "segmentation_labels", None)
             dbg_img = getattr(self.pcd, "segmentation_debug_image_bgr", None)
             dbg_ts = float(getattr(self.pcd, "segmentation_debug_timestamp", 0.0))
+            worker_busy = bool(getattr(self.pcd, "segmentation_worker_busy", False))
+            queue_size = int(getattr(self.pcd, "segmentation_queue_size", 0))
+            processed_count = int(getattr(self.pcd, "segmentation_processed_count", 0))
+            last_kf = int(getattr(self.pcd, "segmentation_last_kf_index", -1))
+            last_total_ms = float(getattr(self.pcd, "segmentation_last_total_ms", 0.0))
+            last_error = str(getattr(self.pcd, "segmentation_last_error", "") or "")
+
+        imgui.separator()
+        imgui.text("Segmenter Status")
+        imgui.text_disabled(
+            f"state={'busy' if worker_busy else 'idle'} | queue={queue_size} | processed={processed_count}"
+        )
+        imgui.text_disabled(f"last keyframe={last_kf} | last total={last_total_ms:.1f} ms")
+        if len(last_error) > 0:
+            imgui.text_colored((0.95, 0.35, 0.35, 1.0), f"Last error: {last_error}")
 
         class_names = list(metadata.get("class_names", []))
         class_palette = np.asarray(metadata.get("class_palette", []), dtype=np.float32)
@@ -76,7 +91,7 @@ class SegmentationLegendWindow:
             self.class_enabled = {}
             self._apply_renderer_filter()
             imgui.separator()
-            imgui.text_disabled("No class-color mapping yet. Wait for YOLO semantic output.")
+            imgui.text_disabled("No class-color mapping yet. Wait for semantic model output.")
             imgui.end()
             return
 
@@ -91,19 +106,26 @@ class SegmentationLegendWindow:
         if metadata:
             ts = float(metadata.get("timestamp", 0.0))
             inf_ms = float(metadata.get("inference_ms", 0.0))
+            post_ms = float(metadata.get("postprocess_ms", 0.0))
+            geom_ms = float(metadata.get("geometry_ms", 0.0))
+            match_ms = float(metadata.get("matching_ms", 0.0))
+            dbg_ms = float(metadata.get("debug_ms", 0.0))
             n_seg = int(metadata.get("num_points_segmented", 0))
             n_tot = int(metadata.get("num_points_total", 0))
             imgui.text_disabled(
                 f"Last update: t={ts:.1f}, inference={inf_ms:.1f} ms, points={n_seg}/{n_tot}"
             )
+            imgui.text_disabled(
+                f"Breakdown(ms): post={post_ms:.1f}, geom={geom_ms:.1f}, match={match_ms:.1f}, debug={dbg_ms:.1f}"
+            )
             imgui.separator()
 
-        changed_img, show_img = imgui.checkbox("Show YOLO segmented image", self.show_segmented_image)
+        changed_img, show_img = imgui.checkbox("Show segmented image", self.show_segmented_image)
         if changed_img:
             self.show_segmented_image = bool(show_img)
 
         if self.show_segmented_image:
-            imgui.text_disabled(f"YOLO image timestamp: {dbg_ts:.3f}")
+            imgui.text_disabled(f"Segmented image timestamp: {dbg_ts:.3f}")
             if dbg_img is not None and getattr(dbg_img, "size", 0) > 0:
                 if self._img_widget is None:
                     self._img_widget = ImageWidget(dbg_img)
@@ -111,7 +133,7 @@ class SegmentationLegendWindow:
                     self._img_widget.set_image_rgb(dbg_img)
                 self._img_widget.draw(fit_to_window=True)
             else:
-                imgui.text_disabled("No YOLO segmented image available yet.")
+                imgui.text_disabled("No segmented image available yet.")
             imgui.separator()
 
         n_selected = int(sum(1 for v in self.class_enabled.values() if bool(v)))

@@ -58,6 +58,10 @@ class PointCloud:
         self.segmentation_colors = None
         self.segmentation_color_logits = None
         self.semantic_confidence = None
+        self.semantic_alt_class = None
+        self.semantic_alt_confidence = None
+        self.semantic_switch_support = None
+        self.semantic_switch_cooldown = None
         self.gaussian_instance_ids = None
         self.segmentation_instances = []
         self.segmentation_metadata = {}
@@ -65,9 +69,15 @@ class PointCloud:
         self.segmentation_debug_image_bgr = None
         self.segmentation_debug_timestamp = 0.0
         self.semantic_decay_factor = float(config.get("semantic_decay_factor", 0.2))
+        self.semantic_challenger_decay_factor = float(config.get("semantic_challenger_decay_factor", self.semantic_decay_factor))
         self.semantic_min_confidence = float(config.get("semantic_min_confidence", 0.35))
         self.semantic_ema_alpha = float(config.get("semantic_ema_alpha", 1.0))
-        self.semantic_assign_min_confidence = float(config.get("yolo_min_confidence", 0.35))
+        self.semantic_switch_margin = float(config.get("semantic_switch_margin", 0.05))
+        self.semantic_switch_support_frames = int(config.get("semantic_switch_support_frames", 3))
+        self.semantic_switch_cooldown_frames = int(config.get("semantic_switch_cooldown_frames", 2))
+        self.semantic_assign_min_confidence = float(
+            config.get("semantic_assignment_min_confidence", config.get("yolo_min_confidence", 0.4))
+        )
         self.instance_min_points = int(config.get("instance_min_points", 30))
         self.instance_iou_gate = float(config.get("instance_iou_gate", 0.15))
         self.instance_center_gate_m = float(config.get("instance_center_gate_m", 0.30))
@@ -316,6 +326,46 @@ class PointCloud:
                         ],
                         dim=0,
                     )
+            if self.semantic_alt_class is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.semantic_alt_class = torch.cat(
+                        [
+                            self.semantic_alt_class,
+                            torch.full((num_new,), -1, dtype=torch.long, device=self.device),
+                        ],
+                        dim=0,
+                    )
+            if self.semantic_alt_confidence is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.semantic_alt_confidence = torch.cat(
+                        [
+                            self.semantic_alt_confidence,
+                            torch.zeros((num_new,), dtype=torch.float32, device=self.device),
+                        ],
+                        dim=0,
+                    )
+            if self.semantic_switch_support is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.semantic_switch_support = torch.cat(
+                        [
+                            self.semantic_switch_support,
+                            torch.zeros((num_new,), dtype=torch.uint8, device=self.device),
+                        ],
+                        dim=0,
+                    )
+            if self.semantic_switch_cooldown is not None:
+                num_new = int(new_data[0].shape[0])
+                if num_new > 0:
+                    self.semantic_switch_cooldown = torch.cat(
+                        [
+                            self.semantic_switch_cooldown,
+                            torch.zeros((num_new,), dtype=torch.uint8, device=self.device),
+                        ],
+                        dim=0,
+                    )
             if self.gaussian_instance_ids is not None:
                 num_new = int(new_data[0].shape[0])
                 if num_new > 0:
@@ -351,6 +401,10 @@ class PointCloud:
             self.segmentation_colors = colors_t
             self.segmentation_color_logits = logits_t
             self.semantic_confidence = torch.where(labels_t >= 0, torch.ones_like(labels_t, dtype=torch.float32), torch.zeros_like(labels_t, dtype=torch.float32))
+            self.semantic_alt_class = torch.full_like(labels_t, -1, dtype=torch.long)
+            self.semantic_alt_confidence = torch.zeros_like(labels_t, dtype=torch.float32)
+            self.semantic_switch_support = torch.zeros_like(labels_t, dtype=torch.uint8)
+            self.semantic_switch_cooldown = torch.zeros_like(labels_t, dtype=torch.uint8)
             if pred_instances is not None:
                 self.segmentation_instances = list(pred_instances)
             self.segmentation_metadata = dict(metadata) if metadata is not None else {}
@@ -392,6 +446,10 @@ class PointCloud:
 
         self.segmentation_labels = _resize_or_init_1d(self.segmentation_labels, -1, torch.long)
         self.semantic_confidence = _resize_or_init_1d(self.semantic_confidence, 0.0, torch.float32)
+        self.semantic_alt_class = _resize_or_init_1d(self.semantic_alt_class, -1, torch.long)
+        self.semantic_alt_confidence = _resize_or_init_1d(self.semantic_alt_confidence, 0.0, torch.float32)
+        self.semantic_switch_support = _resize_or_init_1d(self.semantic_switch_support, 0, torch.uint8)
+        self.semantic_switch_cooldown = _resize_or_init_1d(self.semantic_switch_cooldown, 0, torch.uint8)
         self.gaussian_instance_ids = _resize_or_init_1d(self.gaussian_instance_ids, -1, torch.long)
         self.segmentation_colors = _resize_or_init_2d(self.segmentation_colors, 0.0, torch.float32)
         self.segmentation_color_logits = _resize_or_init_2d(self.segmentation_color_logits, 0.0, torch.float32)
@@ -711,37 +769,125 @@ class PointCloud:
                 cls = cls[keep]
                 conf = conf[keep]
 
-                old_cls = self.segmentation_labels[idx]
-                old_conf = self.semantic_confidence[idx]
-
                 ema_alpha = float(np.clip(self.semantic_ema_alpha, 0.0, 1.0))
-                obs_conf = ema_alpha * conf + (1.0 - ema_alpha) * old_conf
+                p_cls = self.segmentation_labels[idx]
+                p_conf = self.semantic_confidence[idx]
+                c_cls = self.semantic_alt_class[idx]
+                c_conf = self.semantic_alt_confidence[idx]
+                support = self.semantic_switch_support[idx].to(torch.int16)
+                cooldown = self.semantic_switch_cooldown[idx].to(torch.int16)
 
-                same_cls = old_cls == cls
-                reinforced = old_conf + obs_conf * (1.0 - old_conf)
+                same_primary = cls == p_cls
+                p_obs = ema_alpha * conf + (1.0 - ema_alpha) * p_conf
+                p_conf_same = p_conf + p_obs * (1.0 - p_conf)
 
-                penalized = old_conf * (1.0 - obs_conf)
-                switched = obs_conf > penalized
+                challenger_same = cls == c_cls
+                c_obs = ema_alpha * conf + (1.0 - ema_alpha) * c_conf
+                c_conf_diff = torch.where(challenger_same, c_conf + c_obs * (1.0 - c_conf), conf)
+                c_cls_diff = torch.where(challenger_same, c_cls, cls)
 
-                new_cls = torch.where(same_cls | switched, cls, old_cls)
-                new_conf = torch.where(same_cls, reinforced, torch.where(switched, obs_conf, penalized))
+                # Softer decay on conflict to avoid rapid class oscillation.
+                p_conf_diff = p_conf * (1.0 - 0.15 * conf)
+                margin = float(max(0.0, self.semantic_switch_margin))
+                switch_conf_gate = float(max(0.0, self.semantic_assign_min_confidence))
 
-                self.segmentation_labels[idx] = new_cls
-                self.semantic_confidence[idx] = torch.clamp(new_conf, 0.0, 1.0)
+                strength_ready = c_conf_diff > (p_conf_diff + margin)
+                support_thr = int(max(1, self.semantic_switch_support_frames))
+                support_next = torch.where(
+                    same_primary,
+                    torch.zeros_like(support),
+                    torch.where(challenger_same, torch.clamp(support + 1, 0, 255), torch.ones_like(support)),
+                )
+                enough_support = support_next >= support_thr
+                can_switch = cooldown <= 0
+                has_switch_conf = c_conf_diff >= switch_conf_gate
+                switch = (~same_primary) & (
+                    ((p_cls < 0) & has_switch_conf)
+                    | (strength_ready & enough_support & can_switch & has_switch_conf)
+                )
+
+                new_p_cls = torch.where(same_primary, p_cls, torch.where(switch, c_cls_diff, p_cls))
+                new_p_conf = torch.where(same_primary, p_conf_same, torch.where(switch, c_conf_diff, p_conf_diff))
+
+                chall_decay = float(np.clip(self.semantic_challenger_decay_factor, 0.0, 1.0))
+                c_conf_same_primary = c_conf * chall_decay
+                c_cls_same_primary = c_cls
+
+                c_cls_switched = p_cls
+                c_conf_switched = p_conf_diff * 0.5
+
+                c_cls_no_switch = c_cls_diff
+                c_conf_no_switch = c_conf_diff
+
+                new_c_cls = torch.where(
+                    same_primary,
+                    c_cls_same_primary,
+                    torch.where(switch, c_cls_switched, c_cls_no_switch),
+                )
+                new_c_conf = torch.where(
+                    same_primary,
+                    c_conf_same_primary,
+                    torch.where(switch, c_conf_switched, c_conf_no_switch),
+                )
+
+                cooldown_frames = int(max(0, self.semantic_switch_cooldown_frames))
+                cooldown_next = torch.where(
+                    switch,
+                    torch.full_like(cooldown, cooldown_frames),
+                    torch.clamp(cooldown - 1, min=0),
+                )
+                support_final = torch.where(
+                    switch | same_primary,
+                    torch.zeros_like(support_next),
+                    support_next,
+                )
+
+                self.segmentation_labels[idx] = new_p_cls
+                self.semantic_confidence[idx] = torch.clamp(new_p_conf, 0.0, 1.0)
+                self.semantic_alt_class[idx] = torch.where(new_c_conf > 0.0, new_c_cls, torch.full_like(new_c_cls, -1))
+                self.semantic_alt_confidence[idx] = torch.clamp(new_c_conf, 0.0, 1.0)
+                self.semantic_switch_support[idx] = torch.clamp(support_final, 0, 255).to(torch.uint8)
+                self.semantic_switch_cooldown[idx] = torch.clamp(cooldown_next, 0, 255).to(torch.uint8)
                 detected_mask[idx] = True
 
             # Temporal consistency: if a labeled point is not classified this frame,
             # decay its confidence instead of dropping the class immediately.
             if n_map > 0:
                 decay = float(np.clip(self.semantic_decay_factor, 0.0, 1.0))
+                chall_decay = float(np.clip(self.semantic_challenger_decay_factor, 0.0, 1.0))
                 # Forget only points inside current frustum scope.
                 forget_mask = (self.segmentation_labels >= 0) & (~detected_mask) & visible_mask
                 self.semantic_confidence[forget_mask] = self.semantic_confidence[forget_mask] * decay
+                self.semantic_alt_confidence[forget_mask] = self.semantic_alt_confidence[forget_mask] * chall_decay
+                # Decrease cooldown globally for visible unlabeled updates.
+                cool_vis = visible_mask & (~detected_mask)
+                self.semantic_switch_cooldown[cool_vis] = torch.clamp(
+                    self.semantic_switch_cooldown[cool_vis].to(torch.int16) - 1,
+                    min=0,
+                ).to(torch.uint8)
 
             min_conf = float(max(0.0, self.semantic_min_confidence))
+            promote = (
+                (self.segmentation_labels >= 0)
+                & (self.semantic_confidence < min_conf)
+                & (self.semantic_alt_class >= 0)
+                & (self.semantic_alt_confidence >= float(max(min_conf, self.semantic_assign_min_confidence)))
+            )
+            if torch.any(promote):
+                self.segmentation_labels[promote] = self.semantic_alt_class[promote]
+                self.semantic_confidence[promote] = self.semantic_alt_confidence[promote]
+                self.semantic_alt_class[promote] = -1
+                self.semantic_alt_confidence[promote] = 0.0
+                self.semantic_switch_support[promote] = 0
+                self.semantic_switch_cooldown[promote] = 0
+
             low = self.semantic_confidence < min_conf
             self.segmentation_labels[low] = -1
             self.semantic_confidence[low] = 0.0
+            self.semantic_alt_class[low] = -1
+            self.semantic_alt_confidence[low] = 0.0
+            self.semantic_switch_support[low] = 0
+            self.semantic_switch_cooldown[low] = 0
 
             if class_palette is None:
                 n_classes = int(max(1, (torch.max(self.segmentation_labels).item() + 1) if torch.any(self.segmentation_labels >= 0) else 1))
@@ -786,6 +932,7 @@ class PointCloud:
             md["num_points_segmented"] = int(torch.count_nonzero(valid_cls).item())
             md["num_classes_present"] = int(torch.unique(self.segmentation_labels[valid_cls]).numel()) if torch.any(valid_cls) else 0
             md["num_instances"] = int(len(self.segmentation_instances))
+            md["temporal_model"] = "primary_challenger_hysteresis"
 
             self.segmentation_metadata = md
             self.segmentation_version += 1
