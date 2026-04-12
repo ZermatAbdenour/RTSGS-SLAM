@@ -223,3 +223,11 @@ data/
 .vscode/
 logs/
 Models/
+
+
+#scen graph 
+SceneGraph/checkpoints
+SceneGraph/clean_data_all_scans.json
+SceneGraph/clean_data.json
+SceneGraph/data_all_scans.json
+SceneGraph/data.json

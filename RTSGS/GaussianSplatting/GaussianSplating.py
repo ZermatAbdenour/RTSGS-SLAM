@@ -98,7 +98,7 @@ def frustum_cull_mask(
 
 
 class GaussianSplatting:
-    def __init__(self, pcd, dataset, tracker, learning_rate=4e-4, max_steps_per_sec=1000, downsample_factor=1.0):
+    def __init__(self, pcd, dataset, tracker, learning_rate=4e-4, max_steps_per_sec=1000, downsample_factor=2.0):
         self.pcd = pcd
         self.dataset = dataset
         self.device = pcd.device

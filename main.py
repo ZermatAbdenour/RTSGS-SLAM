@@ -19,7 +19,6 @@ if __name__ == "__main__":
     print(torch.__version__)
     if torch.cuda.is_available():
         torch.cuda.init()
-        torch.zeros(1, device="cuda")
 
     # TUM
     #data_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household"
