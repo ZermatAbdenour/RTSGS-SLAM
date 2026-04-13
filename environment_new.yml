@@ -12,11 +12,13 @@ dependencies:
   - asttokens=3.0.1=pyhd8ed1ab_0
   - attr=2.5.2=h39aace5_0
   - blas=1.0=mkl
+  - boto3=1.42.61=py311h06a4308_0
+  - botocore=1.42.61=py311h06a4308_0
   - brotli=1.2.0=hed03a55_1
   - brotli-bin=1.2.0=hb03c661_1
   - brotli-python=1.2.0=py311h66f275b_1
   - bzip2=1.0.8=hda65f42_8
-  - ca-certificates=2026.1.4=hbd8a1cb_0
+  - ca-certificates=2026.3.19=h06a4308_0
   - cairo=1.18.4=h44eff21_0
   - certifi=2026.1.4=pyhd8ed1ab_0
   - cffi=2.0.0=py311h5b438cf_0
@@ -74,6 +76,8 @@ dependencies:
   - jack=1.9.22=h11f4161_0
   - jedi=0.19.2=pyhd8ed1ab_1
   - jinja2=3.1.6=py311h06a4308_0
+  - jmespath=1.1.0=py311h06a4308_0
+  - joblib=1.5.3=py311h06a4308_0
   - jpeg=9e=h166bdaf_2
   - jupyter_client=8.8.0=pyhcf101f3_0
   - jupyter_core=5.9.1=pyhc90fa1f_0
@@ -200,13 +204,12 @@ dependencies:
   - ninja-base=1.13.1=h0f57076_0
   - nspr=4.38=h29cc59b_0
   - nss=3.118=h445c969_0
-  - numpy=1.26.4=py311h64a7726_0
   - ocl-icd=2.3.3=hb9d3cd8_0
   - opencl-headers=2025.06.13=h5888daf_0
   - openh264=2.6.0=ha05cbb4_1
   - openjpeg=2.5.4=h4e0627c_1
   - openldap=2.6.10=h8e75217_0
-  - openssl=3.5.5=h1b28b03_0
+  - openssl=3.5.6=h1b28b03_0
   - p11-kit=0.24.1=hc5aa10d_0
   - packaging=26.0=pyhcf101f3_0
   - parso=0.8.6=pyhcf101f3_0
@@ -227,7 +230,6 @@ dependencies:
   - pure_eval=0.2.3=pyhd8ed1ab_1
   - pycparser=2.22=pyh29332c3_1
   - pygments=2.19.2=pyhd8ed1ab_0
-  - pyopengl=3.1.10=pyha804496_2
   - pyparsing=3.3.2=pyhcf101f3_0
   - pyqt=6.9.1=py311hc79087c_0
   - pyqt5-sip=12.12.2=py311hb755f60_5
@@ -256,7 +258,10 @@ dependencies:
   - qtwebchannel=6.9.2=hbdd6827_1
   - qtwebsockets=6.9.2=hbdd6827_1
   - readline=8.3=h853b02a_0
+  - regex=2026.2.28=py311h47b2149_0
   - requests=2.32.5=pyhcf101f3_1
+  - s3transfer=0.16.0=py311h06a4308_0
+  - sacremoses=0.1.1=py311h06a4308_0
   - setuptools=80.10.2=py311h06a4308_0
   - sip=6.12.0=py311h7934f7d_0
   - six=1.17.0=pyhe01879c_1
@@ -273,6 +278,7 @@ dependencies:
   - torchtriton=2.1.0=py311
   - torchvision=0.16.2=py311_cu121
   - tornado=6.5.4=py311h41d9c34_0
+  - tqdm=4.67.3=py311h7040dfc_1
   - traitlets=5.14.3=pyhd8ed1ab_1
   - typing_extensions=4.15.0=pyhcf101f3_0
   - tzdata=2025c=hc9c84f9_1
@@ -319,34 +325,97 @@ dependencies:
   - zstandard=0.23.0=py311h49ec1c0_3
   - zstd=1.5.7=hb78ec9c_6
   - pip:
+      - absl-py==2.4.0
+      - accelerate==1.13.0
+      - addict==2.4.0
+      - attrs==26.1.0
+      - blinker==1.9.0
+      - ccimport==0.4.4
+      - click==8.3.1
+      - clip==1.0
+      - configargparse==1.7.5
+      - cuda-pathfinder==1.5.1
+      - cuda-toolkit==12.9.1
+      - cumm-cu118==0.7.11
+      - cupy-cuda12x==14.0.1
+      - dash==4.0.0
       - difficp==1.0
+      - fastjsonschema==2.21.2
+      - fire==0.7.1
+      - flask==3.1.3
+      - freetype-py==2.5.1
       - fsspec==2026.2.0
+      - ftfy==6.3.1
       - glfw==2.10.0
+      - grpcio==1.78.0
       - gsplat==1.5.3
+      - hf-xet==1.4.3
+      - huggingface-hub==0.36.2
       - imageio==2.9.0
       - imgui-bundle==1.92.5
+      - importlib-metadata==9.0.0
       - iopath==0.1.10
+      - ipywidgets==8.1.8
+      - itsdangerous==2.2.0
       - jaxtyping==0.3.7
-      - kornia==0.5.11
+      - jsonschema==4.26.0
+      - jsonschema-specifications==2025.9.1
+      - jupyterlab-widgets==3.0.16
+      - lark==1.3.1
+      - markdown==3.10.2
       - markdown-it-py==4.0.0
       - mdurl==0.1.2
       - minkowskiengine==0.5.4
+      - munch==4.0.0
+      - narwhals==2.18.0
+      - nbformat==5.10.4
       - ninja==1.13.0
-      - opencv-contrib-python-headless==4.7.0.72
+      - numpy==1.26.4
+      - nvidia-cuda-runtime-cu12==12.9.79
+      - nvidia-curand-cu12==10.3.10.19
+      - open3d==0.19.0
+      - opencv-contrib-python-headless==4.13.0.92
       - panda==0.3.1
       - pandas==3.0.1
+      - pccm==0.4.16
+      - plotly==6.6.0
+      - plyfile==1.1.3
       - portalocker==3.2.0
+      - protobuf==7.34.1
+      - pybind11==3.0.2
+      - pycolmap==4.0.3
+      - pycolmap-cuda12==4.0.3
+      - pyglet==2.1.14
       - pyntcloud==0.3.1
+      - pyopengl==3.1.0
       - pyopengl-accelerate==3.1.10
       - pypng==0.20220715.0
+      - pyquaternion==0.9.9
+      - pyrender==0.1.45
       - pytorch-msssim==1.0.0
       - pytorch3d==0.7.9
+      - referencing==0.37.0
+      - retrying==1.4.2
       - rich==14.3.2
+      - rpds-py==0.30.0
+      - safetensors==0.7.0
+      - scikit-learn==1.8.0
       - scipy==1.17.0
       - softgroup==1.0
+      - spconv-cu118==2.3.8
       - sympy==1.13.1
-      - tqdm==4.67.3
-      - transformers==4.52.4
+      - tensorboard==2.20.0
+      - tensorboard-data-server==0.7.2
+      - tensorboardx==2.6.4
+      - termcolor==3.3.0
+      - threadpoolctl==3.6.0
       - timm==1.0.19
+      - tokenizers==0.21.4
+      - transformers==4.52.4
+      - trimesh==4.11.5
+      - ultralytics==8.4.27
       - wadler-lindig==0.1.7
+      - werkzeug==3.1.6
+      - widgetsnbextension==4.0.15
+      - zipp==3.23.0
 prefix: /home/abdou/Programs/miniconda3/envs/rtsgs
