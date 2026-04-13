@@ -231,3 +231,4 @@ SceneGraph/clean_data_all_scans.json
 SceneGraph/clean_data.json
 SceneGraph/data_all_scans.json
 SceneGraph/data.json
+SceneGraph/clip_embedding_dataset
