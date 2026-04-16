@@ -88,6 +88,11 @@ class PointCloud:
         self._instance_next_id = 1
         self._instance_frame_idx = 0
 
+        # Real-time scene graph outputs.
+        self.scene_graph_state = {}
+        self.scene_graph_version = 0
+        self.scene_graph_last_error = ""
+
         # Voxel Packing
         self._pack_offset = int(config.get("pack_offset", 1_000_000))
         self._pack_base = 2 * self._pack_offset + 1
@@ -472,6 +477,54 @@ class PointCloud:
         center = 0.5 * (bmin + bmax)
         return bmin, bmax, center
 
+    def _instance_obb(self, indices_t: torch.Tensor):
+        if indices_t.numel() == 0 or self.all_points is None:
+            return None
+        pts = self.all_points[indices_t]
+        if pts.numel() == 0:
+            return None
+
+        n = int(pts.shape[0])
+        centroid = torch.mean(pts, dim=0)
+        centered = pts - centroid
+
+        # PCA frame for oriented extents.
+        if n >= 3:
+            cov = (centered.T @ centered) / float(max(n - 1, 1))
+            evals, evecs = torch.linalg.eigh(cov)
+            order = torch.argsort(evals, descending=True)
+            R = evecs[:, order]
+            if torch.det(R) < 0:
+                R[:, 2] = -R[:, 2]
+        else:
+            R = torch.eye(3, device=self.device, dtype=torch.float32)
+
+        local = centered @ R
+        q = float(np.clip(self.instance_bbox_quantile, 0.0, 0.2))
+        if q > 0.0 and n >= 8:
+            lo = torch.tensor(q, device=self.device, dtype=pts.dtype)
+            hi = torch.tensor(1.0 - q, device=self.device, dtype=pts.dtype)
+            local_min = torch.quantile(local, lo, dim=0)
+            local_max = torch.quantile(local, hi, dim=0)
+        else:
+            local_min = torch.amin(local, dim=0)
+            local_max = torch.amax(local, dim=0)
+
+        axes_lengths = (local_max - local_min).clamp_min(1e-6)
+        local_center = 0.5 * (local_min + local_max)
+        obb_centroid = centroid + (R @ local_center)
+
+        # Use the shortest OBB axis as dominant normal proxy.
+        n_idx = int(torch.argmin(axes_lengths).item())
+        dominant_normal = R[:, n_idx]
+
+        return {
+            "centroid": obb_centroid,
+            "axesLengths": axes_lengths,
+            "normalizedAxes": R.reshape(-1),
+            "dominantNormal": dominant_normal,
+        }
+
     @staticmethod
     def _bbox_iou_3d(a_min, a_max, b_min, b_max) -> float:
         inter_min = torch.maximum(a_min, b_min)
@@ -513,6 +566,7 @@ class PointCloud:
             if box is None:
                 continue
             bmin, bmax, center = box
+            obb = self._instance_obb(idx)
 
             conf = self.semantic_confidence[idx]
             score = float(torch.mean(conf).item()) if conf.numel() > 0 else 0.0
@@ -526,6 +580,12 @@ class PointCloud:
                     "bbox_min": bmin.detach().cpu().numpy().tolist(),
                     "bbox_max": bmax.detach().cpu().numpy().tolist(),
                     "center": center.detach().cpu().numpy().tolist(),
+                    "obb": {
+                        "centroid": obb["centroid"].detach().cpu().numpy().tolist() if obb is not None else center.detach().cpu().numpy().tolist(),
+                        "axesLengths": obb["axesLengths"].detach().cpu().numpy().tolist() if obb is not None else (bmax - bmin).detach().cpu().numpy().tolist(),
+                        "normalizedAxes": obb["normalizedAxes"].detach().cpu().numpy().tolist() if obb is not None else torch.eye(3, device=self.device, dtype=torch.float32).reshape(-1).detach().cpu().numpy().tolist(),
+                    },
+                    "dominantNormal": obb["dominantNormal"].detach().cpu().numpy().tolist() if obb is not None else [0.0, 0.0, 1.0],
                 }
             )
 
@@ -588,8 +648,16 @@ class PointCloud:
 
                 iou = self._bbox_iou_3d(bmin, bmax, ibmin, ibmax)
                 dist = float(torch.linalg.norm(center - icenter).item())
-                if iou >= float(self.instance_iou_gate) or dist <= float(self.instance_center_gate_m):
-                    match_score = iou - 0.05 * dist
+                isize = (ibmax - ibmin).clamp_min(1e-6)
+                csize = (bmax - bmin).clamp_min(1e-6)
+                size_ratio = torch.maximum(csize / isize, isize / csize)
+                size_ratio = float(torch.max(size_ratio).item())
+
+                center_gate = float(self.instance_center_gate_m)
+                close_and_similar = (dist <= center_gate) and (size_ratio <= 2.5)
+                if iou >= float(self.instance_iou_gate) or close_and_similar:
+                    proximity = max(0.0, 1.0 - dist / max(center_gate, 1e-6))
+                    match_score = iou + 0.20 * proximity - 0.05 * max(0.0, size_ratio - 1.0)
                     if match_score > best_score:
                         best_score = match_score
                         best_id = int(inst.get("instance_id", -1))
@@ -616,8 +684,10 @@ class PointCloud:
                     continue
                 ibmin = torch.tensor(inst.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
                 ibmax = torch.tensor(inst.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
-                new_bmin = torch.minimum(ibmin, bmin)
-                new_bmax = torch.maximum(ibmax, bmax)
+                # EMA update avoids runaway bbox growth and identity collapse.
+                box_ema = 0.25
+                new_bmin = (1.0 - box_ema) * ibmin + box_ema * bmin
+                new_bmax = (1.0 - box_ema) * ibmax + box_ema * bmax
                 new_center = 0.5 * (new_bmin + new_bmax)
 
                 inst["bbox_min"] = new_bmin.detach().cpu().numpy().tolist()
@@ -626,6 +696,9 @@ class PointCloud:
                 inst["score"] = max(float(inst.get("score", 0.0)), score)
                 inst["last_seen_frame"] = frame_idx
                 inst["missed_frames"] = 0
+
+            # Return the chosen tracking id to upstream consumers.
+            cand["instance_id"] = int(best_id)
 
             self.gaussian_instance_ids[idx] = int(best_id)
 
@@ -678,10 +751,8 @@ class PointCloud:
                     center_dist = float(torch.linalg.norm(a_center - b_center).item())
 
                     should_merge = (
-                        iou > 0.0
-                        or
                         iou >= float(self.instance_bbox_merge_iou)
-                        or center_dist <= float(self.instance_bbox_merge_center_gate_m)
+                        or (iou >= 0.05 and center_dist <= float(self.instance_bbox_merge_center_gate_m))
                     )
                     if not should_merge:
                         j += 1

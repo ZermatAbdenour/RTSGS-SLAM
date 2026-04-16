@@ -7,6 +7,7 @@ from RTSGS.GUI.PerformanceWindow import PerformanceWindow
 from RTSGS.GUI.ProfilerWindow import ProfilerWindow
 from RTSGS.GUI.GaussianSplattingWindow import GaussianSplattingWindow
 from RTSGS.GUI.SegmentationLegendWindow import SegmentationLegendWindow
+from RTSGS.GUI.SceneGraphWindow import SceneGraphWindow
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GaussianSplatting.Renderer.OpenGLRenderer import Renderer
@@ -69,6 +70,7 @@ class WindowManager:
         self.viewport_window = ViewportWindow(self.opengl_renderer)
         self.gaussian_splating_window = GaussianSplattingWindow(point_cloud,camera)
         self.segmentation_legend_window = SegmentationLegendWindow(point_cloud, self.opengl_renderer)
+        self.scene_graph_window = SceneGraphWindow(point_cloud)
         #time
         self._last_time = None
         self._delta_time = 0.016
@@ -95,6 +97,10 @@ class WindowManager:
                 clicked, _ = imgui.menu_item("Segmentation", "", self.segmentation_legend_window.is_open, True)
                 if clicked:
                     self.segmentation_legend_window.is_open = not self.segmentation_legend_window.is_open
+
+                clicked, _ = imgui.menu_item("Scene Graph", "", self.scene_graph_window.is_open, True)
+                if clicked:
+                    self.scene_graph_window.is_open = not self.scene_graph_window.is_open
                 imgui.end_menu()
 
             imgui.end_main_menu_bar()
@@ -148,6 +154,9 @@ class WindowManager:
 
         if self.segmentation_legend_window.is_open:
             self.segmentation_legend_window.draw()
+
+        if self.scene_graph_window.is_open:
+            self.scene_graph_window.draw()
 
     def render_frame(self):
         self.update_delta_time()

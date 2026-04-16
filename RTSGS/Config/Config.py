@@ -58,6 +58,21 @@ class Config:
             self.config_dict.setdefault("semantic_cull_far", 50.0)
             self.config_dict.setdefault("semantic_cull_pad_px", 2.0)
 
+            # Real-time scene graph: masked segment -> CLIP -> residual -> MP-GNN.
+            self.config_dict.setdefault("scenegraph_enabled", True)
+            self.config_dict.setdefault("scenegraph_clip_model_name", "ViT-B/32")
+            self.config_dict.setdefault("scenegraph_max_objects_per_keyframe", 12)
+            self.config_dict.setdefault("scenegraph_update_stride", 1)
+            self.config_dict.setdefault("scenegraph_max_nodes", 48)
+            self.config_dict.setdefault("scenegraph_max_relations", 256)
+            self.config_dict.setdefault("scenegraph_rel_threshold", 0.5)
+            self.config_dict.setdefault("scenegraph_knn_k", 6)
+            self.config_dict.setdefault("scenegraph_instance_ttl", 30)
+            self.config_dict.setdefault("scenegraph_residual_checkpoint", "SceneGraph/checkpoints/temporal_residual/best.pt")
+            self.config_dict.setdefault("scenegraph_gnn_checkpoint", "SceneGraph/checkpoints/scenegraph_multiscan/best.pt")
+            self.config_dict.setdefault("scenegraph_relationships_path", "Datasets/3DSSG/3DSSG/relationships.txt")
+            self.config_dict.setdefault("scenegraph_min_mask_pixels", 200)
+
     def get_rgb_intrinsics(self):
         return np.array(
             [[self.config_dict['rgb_fx'], 0, self.config_dict['rgb_cx']],

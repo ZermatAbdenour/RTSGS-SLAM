@@ -8,6 +8,7 @@ from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.DataLoader.DataLoader import DataLoader
 from RTSGS.Tracker.Tracker import Tracker
 from RTSGS.Segmentation.Segmenter import YOLOSemanticSegmenter
+from RTSGS.SceneGraph import RealtimeSceneGraphRuntime
 
 import cv2
 import numpy as np
@@ -52,6 +53,7 @@ class RTSGSSystem:
 
         project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
         self.segmenter = YOLOSemanticSegmenter(self.pcd, config, project_root)
+        self.scene_graph = RealtimeSceneGraphRuntime(self.pcd, config, project_root)
 
         # Segmenter runtime status shown in GUI.
         with self.pcd.lock:
@@ -70,6 +72,7 @@ class RTSGSSystem:
         self._worker.start()
         self._seg_worker.start()
         self.segmenter.start()
+        self.scene_graph.start()
 
         while not self.window.window_should_close():
             self.window.start_frame()
@@ -133,6 +136,7 @@ class RTSGSSystem:
         self._worker.join(timeout=1.0)
         self._seg_worker.join(timeout=1.0)
         self.segmenter.stop()
+        self.scene_graph.stop()
         self.window.shutdown()
 
     def process_stream_frame(self):
@@ -194,7 +198,13 @@ class RTSGSSystem:
 
             try:
                 t0 = time.perf_counter()
-                self.segmenter.process_frame(rgb, depth, pose)
+                seg_result = self.segmenter.process_frame(rgb, depth, pose)
+                try:
+                    self.scene_graph.update_from_segmenter(seg_result, int(kf_index))
+                except Exception as scene_e:
+                    with self.pcd.lock:
+                        self.pcd.scene_graph_last_error = str(scene_e)
+                    print(f"Scene graph worker error: {scene_e}")
                 self._seg_last_total_ms = float((time.perf_counter() - t0) * 1000.0)
                 self._seg_last_kf_index = int(kf_index)
                 self._seg_processed_count += 1

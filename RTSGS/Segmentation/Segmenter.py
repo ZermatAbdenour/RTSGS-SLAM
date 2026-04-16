@@ -30,6 +30,9 @@ class YOLOSemanticSegmenter:
         self.cull_near = float(config.get("semantic_cull_near", 0.05))
         self.cull_far = float(config.get("semantic_cull_far", 50.0))
         self.cull_pad_px = float(config.get("semantic_cull_pad_px", 2.0))
+        self.scenegraph_enabled = bool(config.get("scenegraph_enabled", True))
+        self.scenegraph_max_objects_per_keyframe = int(config.get("scenegraph_max_objects_per_keyframe", 12))
+        self.scenegraph_min_mask_pixels = int(config.get("scenegraph_min_mask_pixels", 200))
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device_str = "cuda:0" if self.device.type == "cuda" else "cpu"
@@ -195,17 +198,17 @@ class YOLOSemanticSegmenter:
     @torch.inference_mode()
     def process_frame(self, rgb_bgr: np.ndarray, depth_raw: np.ndarray, pose_w: np.ndarray | None):
         if not self.enabled or rgb_bgr is None or depth_raw is None:
-            return
+            return None
         if pose_w is None:
-            return
+            return None
         if not self._ensure_model():
-            return
+            return None
 
         with self.pcd.lock:
             means = self.pcd.all_points
 
         if means is None or int(means.shape[0]) == 0:
-            return
+            return None
         n_map = int(means.shape[0])
 
         t0 = time.perf_counter()
@@ -302,7 +305,7 @@ class YOLOSemanticSegmenter:
                 pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": 0},
             )
-            return
+            return {"scenegraph_observations": [], "metadata": {"inference_ms": float(infer_ms), "num_detections": 0}}
 
         n_low_conf_discarded = 0
 
@@ -317,7 +320,7 @@ class YOLOSemanticSegmenter:
                 pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))},
             )
-            return
+            return {"scenegraph_observations": [], "metadata": {"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))}}
 
         t_geom1 = time.perf_counter()
         depth_edge = self._depth_edge_mask(depth_t) if self.semantic_depth_edge_reject_enabled else torch.zeros_like(depth_t, dtype=torch.bool)
@@ -341,7 +344,7 @@ class YOLOSemanticSegmenter:
                 pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))},
             )
-            return
+            return {"scenegraph_observations": [], "metadata": {"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))}}
 
         vis_idx = visible_depth_idx[in_depth]
         Pc = Pc[in_depth]
@@ -359,7 +362,7 @@ class YOLOSemanticSegmenter:
                 pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))},
             )
-            return
+            return {"scenegraph_observations": [], "metadata": {"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))}}
 
         vis_idx = vis_idx[edge_ok]
         Pc = Pc[edge_ok]
@@ -378,7 +381,7 @@ class YOLOSemanticSegmenter:
                 pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))},
             )
-            return
+            return {"scenegraph_observations": [], "metadata": {"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))}}
 
         vis_idx = vis_idx[valid_rgb]
         points_rgb = points_rgb[valid_rgb]
@@ -398,7 +401,7 @@ class YOLOSemanticSegmenter:
                 pred_instances=[],
                 metadata={"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))},
             )
-            return
+            return {"scenegraph_observations": [], "metadata": {"inference_ms": float(infer_ms), "num_detections": int(len(segments_info))}}
 
         vis_idx = vis_idx[in_img]
         ui = ui[in_img]
@@ -447,6 +450,7 @@ class YOLOSemanticSegmenter:
             obs_conf.append(torch.full_like(g_idx, float(seg_score), dtype=torch.float32, device=self.device))
             pred_instances.append(
                 {
+                    "seg_id": int(seg_id),
                     "class_id": int(local_class_id),
                     "confidence": float(seg_score),
                     "gaussian_indices": g_idx,
@@ -473,6 +477,21 @@ class YOLOSemanticSegmenter:
             conf_t = conf_t[keep_final]
 
         total_ms = (time.perf_counter() - t0) * 1000.0
+        fused_metadata = {
+            "timestamp": time.time(),
+            "inference_ms": float(infer_ms),
+            "total_ms": float(total_ms),
+            "postprocess_ms": float(post_ms),
+            "debug_ms": float(debug_ms),
+            "geometry_ms": float(geom_ms),
+            "matching_ms": float(match_ms),
+            "num_detections": int(len(segments_info)),
+            "num_visible_segments": int(len(ranked_segments)),
+            "num_gaussians_observed": int(idx_t.numel()),
+            "assignment_confidence_gate": float(self.assignment_confidence_gate),
+            "low_conf_detections_discarded": int(n_low_conf_discarded),
+            "model_id": self.model_id,
+        }
         self.pcd.fuse_semantic_observations(
             idx_t,
             cls_t,
@@ -481,19 +500,89 @@ class YOLOSemanticSegmenter:
             class_names=self._names,
             class_palette=self._palette_t,
             pred_instances=pred_instances,
-            metadata={
-                "timestamp": time.time(),
-                "inference_ms": float(infer_ms),
-                "total_ms": float(total_ms),
-                "postprocess_ms": float(post_ms),
-                "debug_ms": float(debug_ms),
-                "geometry_ms": float(geom_ms),
-                "matching_ms": float(match_ms),
-                "num_detections": int(len(segments_info)),
-                "num_visible_segments": int(len(ranked_segments)),
-                "num_gaussians_observed": int(idx_t.numel()),
-                "assignment_confidence_gate": float(self.assignment_confidence_gate),
-                "low_conf_detections_discarded": int(n_low_conf_discarded),
-                "model_id": self.model_id,
-            },
+            metadata=fused_metadata,
         )
+
+        scenegraph_observations = []
+        if self.scenegraph_enabled and len(pred_instances) > 0:
+            with self.pcd.lock:
+                inst_list = list(getattr(self.pcd, "segmentation_instances", []) or [])
+            inst_lookup = {int(i.get("instance_id", -1)): i for i in inst_list if isinstance(i, dict)}
+
+            ranked_pred = sorted(
+                [p for p in pred_instances if isinstance(p, dict)],
+                key=lambda p: float(p.get("confidence", 0.0)),
+                reverse=True,
+            )[: max(0, int(self.scenegraph_max_objects_per_keyframe))]
+
+            for pred in ranked_pred:
+                seg_id = int(pred.get("seg_id", -1))
+                inst_id = int(pred.get("instance_id", -1))
+                g_idx = pred.get("gaussian_indices", None)
+                if seg_id < 0 or g_idx is None:
+                    continue
+                if not isinstance(g_idx, torch.Tensor):
+                    continue
+                g_idx = g_idx.to(self.device, dtype=torch.long).reshape(-1)
+                g_idx = g_idx[(g_idx >= 0) & (g_idx < n_map)]
+                if g_idx.numel() == 0:
+                    continue
+
+                mask_full = segmentation == seg_id
+                if not np.any(mask_full):
+                    continue
+                ys, xs = np.where(mask_full)
+                if ys.size == 0 or xs.size == 0:
+                    continue
+
+                y0, y1 = int(ys.min()), int(ys.max())
+                x0, x1 = int(xs.min()), int(xs.max())
+                crop = np.asarray(rgb_bgr[y0 : y1 + 1, x0 : x1 + 1], dtype=np.uint8).copy()
+                mask_crop = mask_full[y0 : y1 + 1, x0 : x1 + 1]
+                if int(np.count_nonzero(mask_crop)) < int(self.scenegraph_min_mask_pixels):
+                    continue
+                crop[~mask_crop] = 0
+
+                pts = means[g_idx]
+                center = torch.mean(pts, dim=0)
+                bmin = torch.amin(pts, dim=0)
+                bmax = torch.amax(pts, dim=0)
+
+                inst_meta = inst_lookup.get(inst_id, {})
+                obb_meta = inst_meta.get("obb", {}) if isinstance(inst_meta, dict) else {}
+                dom_meta = inst_meta.get("dominantNormal", None) if isinstance(inst_meta, dict) else None
+
+                if isinstance(obb_meta, dict) and "axesLengths" in obb_meta and "normalizedAxes" in obb_meta and "centroid" in obb_meta:
+                    obb = {
+                        "centroid": obb_meta.get("centroid", center.detach().cpu().numpy().tolist()),
+                        "axesLengths": obb_meta.get("axesLengths", (bmax - bmin).detach().cpu().numpy().tolist()),
+                        "normalizedAxes": obb_meta.get("normalizedAxes", [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0]),
+                    }
+                else:
+                    obb = {
+                        "centroid": center.detach().cpu().numpy().tolist(),
+                        "axesLengths": (bmax - bmin).detach().cpu().numpy().tolist(),
+                        "normalizedAxes": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
+                    }
+
+                if isinstance(dom_meta, (list, tuple)) and len(dom_meta) >= 3:
+                    dominant_normal = [float(dom_meta[0]), float(dom_meta[1]), float(dom_meta[2])]
+                else:
+                    dominant_normal = [0.0, 0.0, 1.0]
+
+                scenegraph_observations.append(
+                    {
+                        "seg_id": seg_id,
+                        "instance_id": inst_id,
+                        "class_id": int(pred.get("class_id", -1)),
+                        "confidence": float(pred.get("confidence", 0.0)),
+                        "center": center.detach().cpu().numpy().tolist(),
+                        "bbox_min": bmin.detach().cpu().numpy().tolist(),
+                        "bbox_max": bmax.detach().cpu().numpy().tolist(),
+                        "obb": obb,
+                        "dominantNormal": dominant_normal,
+                        "crop_bgr": crop,
+                    }
+                )
+
+        return {"scenegraph_observations": scenegraph_observations, "metadata": fused_metadata}
