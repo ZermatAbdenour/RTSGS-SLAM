@@ -1,0 +1,151 @@
+ade_index,ade_class,nyu40_index,nyu40_class
+0,wall,0,wall
+1,building,37,otherstructure
+2,sky,37,otherstructure
+3,floor,1,floor
+4,tree,37,otherstructure
+5,ceiling,21,ceiling
+6,road,37,otherstructure
+7,bed,3,bed
+8,windowpane,8,window
+9,grass,37,otherstructure
+10,cabinet,2,cabinet
+11,sidewalk,37,otherstructure
+12,person,30,person
+13,earth,37,otherstructure
+14,door,7,door
+15,table,6,table
+16,mountain,37,otherstructure
+17,plant,37,otherstructure
+18,curtain,15,curtain
+19,chair,4,chair
+20,car,37,otherstructure
+21,water,37,otherstructure
+22,painting,10,picture
+23,sofa,5,sofa
+24,shelf,14,shelves
+25,house,37,otherstructure
+26,sea,37,otherstructure
+27,mirror,18,mirror
+28,rug,19,floor mat
+29,field,37,otherstructure
+30,armchair,4,chair
+31,seat,4,chair
+32,fence,37,otherstructure
+33,desk,13,desk
+34,rock,37,otherstructure
+35,wardrobe,2,cabinet
+36,lamp,34,lamp
+37,bathtub,35,bathtub
+38,railing,37,otherstructure
+39,cushion,17,pillow
+40,base,39,otherprop
+41,box,28,box
+42,column,37,otherstructure
+43,signboard,39,otherprop
+44,chest of drawers,16,dresser
+45,counter,11,counter
+46,sand,37,otherstructure
+47,sink,33,sink
+48,skyscraper,37,otherstructure
+49,fireplace,38,otherfurniture
+50,refrigerator,23,refrigerator
+51,grandstand,37,otherstructure
+52,path,37,otherstructure
+53,stairs,37,otherstructure
+54,runway,37,otherstructure
+55,case,39,otherprop
+56,pool table,39,otherprop
+57,pillow,17,pillow
+58,screen door,7,door
+59,stairway,37,otherstructure
+60,river,37,otherstructure
+61,bridge,37,otherstructure
+62,bookcase,9,bookshelf
+63,blind,12,blinds
+64,coffee table,6,table
+65,toilet,32,toilet
+66,flower,37,otherstructure
+67,book,22,books
+68,hill,37,otherstructure
+69,bench,4,chair
+70,countertop,11,counter
+71,stove,39,otherprop
+72,palm,37,otherstructure
+73,kitchen island,11,counter
+74,computer,39,otherprop
+75,swivel chair,4,chair
+76,boat,37,otherstructure
+77,bar,39,otherprop
+78,arcade machine,39,otherprop
+79,hovel,37,otherstructure
+80,bus,37,otherstructure
+81,towel,25,paper
+82,light,34,lamp
+83,truck,37,otherstructure
+84,tower,37,otherstructure
+85,chandelier,34,lamp
+86,awning,37,otherstructure
+87,streetlight,34,lamp
+88,booth,39,otherprop
+89,television receiver,24,television
+90,airplane,37,otherstructure
+91,dirt track,37,otherstructure
+92,apparel,20,clothes
+93,pole,37,otherstructure
+94,land,37,otherstructure
+95,bannister,37,otherstructure
+96,escalator,37,otherstructure
+97,ottoman,38,otherfurniture
+98,bottle,39,otherprop
+99,buffet,38,otherfurniture
+100,poster,10,picture
+101,stage,37,otherstructure
+102,van,37,otherstructure
+103,ship,37,otherstructure
+104,fountain,37,otherstructure
+105,conveyor belt,39,otherprop
+106,canopy,37,otherstructure
+107,washer,39,otherprop
+108,plaything,39,otherprop
+109,swimming pool,37,otherstructure
+110,stool,4,chair
+111,barrel,39,otherprop
+112,basket,39,otherprop
+113,waterfall,37,otherstructure
+114,tent,37,otherstructure
+115,bag,36,bag
+116,minibike,37,otherstructure
+117,cradle,38,otherfurniture
+118,oven,39,otherprop
+119,ball,39,otherprop
+120,food,39,otherprop
+121,step,37,otherstructure
+122,tank,37,otherstructure
+123,trade name,39,otherprop
+124,microwave,39,otherprop
+125,pot,39,otherprop
+126,animal,37,otherstructure
+127,bicycle,37,otherstructure
+128,lake,37,otherstructure
+129,dishwasher,39,otherprop
+130,screen,24,television
+131,blanket,39,otherprop
+132,sculpture,10,picture
+133,hood,39,otherprop
+134,sconce,34,lamp
+135,vase,39,otherprop
+136,traffic light,37,otherstructure
+137,tray,39,otherprop
+138,ashcan,39,otherprop
+139,fan,39,otherprop
+140,pier,37,otherstructure
+141,CRT screen,24,television
+142,plate,39,otherprop
+143,monitor,24,television
+144,bulletin board,10,picture
+145,shower,39,otherprop
+146,radiator,38,otherfurniture
+147,glass,39,otherprop
+148,clock,39,otherprop
+149,flag,37,otherstructure

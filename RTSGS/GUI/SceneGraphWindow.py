@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import math
+
 from imgui_bundle import imgui
 
 
@@ -15,6 +17,9 @@ class SceneGraphWindow:
         self.zoom = 1.0
         self.zoom_min = 0.35
         self.zoom_max = 4.0
+        self.pan_px = imgui.ImVec2(0.0, 0.0)
+        self._drag_start = None
+        self._drag_is_panning = False
 
     @staticmethod
     def _class_name(class_id: int, class_names):
@@ -56,6 +61,7 @@ class SceneGraphWindow:
 
         nodes = state.get("nodes", []) if isinstance(state.get("nodes", []), list) else []
         relations = state.get("relations", []) if isinstance(state.get("relations", []), list) else []
+        debug = state.get("debug", {}) if isinstance(state.get("debug", {}), dict) else {}
         class_names = list(seg_meta.get("class_names", []))
 
         imgui.text_disabled(
@@ -63,6 +69,18 @@ class SceneGraphWindow:
         )
         if err:
             imgui.text_colored((0.95, 0.35, 0.35, 1.0), f"Last error: {err}")
+
+        if debug:
+            imgui.text_disabled(
+                f"frame_obs={int(debug.get('frame_observations', 0))} | "
+                f"frame_feats={int(debug.get('frame_features', 0))} | "
+                f"frame_pairs={int(debug.get('frame_pairs', 0))} | "
+                f"edge_pairs={int(debug.get('edge_pairs_total', 0))} | "
+                f"rels_raw={int(debug.get('relations_raw', 0))} | "
+                f"rels_kept={int(debug.get('relations_kept', 0))} | "
+                f"max_score={float(debug.get('max_relation_score', 0.0)):.3f} | "
+                f"max_prob={float(debug.get('max_relation_prob', 0.0)):.3f}"
+            )
 
         changed_labels, v_labels = imgui.checkbox("Show node labels", self.show_labels)
         if changed_labels:
@@ -80,6 +98,10 @@ class SceneGraphWindow:
         imgui.same_line()
         if imgui.button("Reset zoom"):
             self.zoom = 1.0
+
+        imgui.same_line()
+        if imgui.button("Reset pan"):
+            self.pan_px = imgui.ImVec2(0.0, 0.0)
 
         imgui.same_line()
         if imgui.button("Clear selection"):
@@ -105,8 +127,30 @@ class SceneGraphWindow:
 
         imgui.invisible_button("scenegraph_canvas", imgui.ImVec2(canvas_w, canvas_h))
         canvas_hovered = bool(imgui.is_item_hovered())
+        io = imgui.get_io()
+
+        # Left-drag pan for graph navigation. Click (no drag) keeps selection.
+        if canvas_hovered and imgui.is_mouse_clicked(0):
+            mp = imgui.get_mouse_pos()
+            self._drag_start = (float(mp.x), float(mp.y))
+            self._drag_is_panning = False
+
+        if canvas_hovered and imgui.is_mouse_down(0) and self._drag_start is not None:
+            mp = imgui.get_mouse_pos()
+            dx = float(mp.x) - float(self._drag_start[0])
+            dy = float(mp.y) - float(self._drag_start[1])
+            if (dx * dx + dy * dy) >= (3.0 * 3.0):
+                self._drag_is_panning = True
+            if self._drag_is_panning:
+                md = getattr(io, "mouse_delta", None)
+                if md is not None:
+                    self.pan_px.x += float(md.x)
+                    self.pan_px.y += float(md.y)
+
+        if imgui.is_mouse_released(0):
+            self._drag_start = None
         if canvas_hovered:
-            wheel = float(getattr(imgui.get_io(), "mouse_wheel", 0.0))
+            wheel = float(getattr(io, "mouse_wheel", 0.0))
             if abs(wheel) > 1e-6:
                 self.zoom *= 1.0 + 0.12 * wheel
                 self.zoom = max(self.zoom_min, min(self.zoom_max, self.zoom))
@@ -120,44 +164,33 @@ class SceneGraphWindow:
             imgui.end()
             return
 
-        min_x = float("inf")
-        max_x = float("-inf")
-        min_z = float("inf")
-        max_z = float("-inf")
-        for n in nodes:
-            x, z = self._safe_center(n)
-            min_x = min(min_x, x)
-            max_x = max(max_x, x)
-            min_z = min(min_z, z)
-            max_z = max(max_z, z)
+        if len(relations) == 0:
+            imgui.text_colored((0.98, 0.70, 0.25, 1.0), "No relations predicted at current threshold.")
 
-        if max_x <= min_x:
-            max_x = min_x + 1.0
-        if max_z <= min_z:
-            max_z = min_z + 1.0
+        canvas_cx = 0.5 * (p0.x + p1.x) + float(self.pan_px.x)
+        canvas_cy = 0.5 * (p0.y + p1.y) + float(self.pan_px.y)
 
-        pad = 24.0
-        sx = (canvas_w - 2.0 * pad) / (max_x - min_x)
-        sz = (canvas_h - 2.0 * pad) / (max_z - min_z)
-        scale = max(1e-6, min(sx, sz) * float(self.zoom))
-
-        cx_world = 0.5 * (min_x + max_x)
-        cz_world = 0.5 * (min_z + max_z)
-        canvas_cx = 0.5 * (p0.x + p1.x)
-        canvas_cz = 0.5 * (p0.y + p1.y)
-
-        def to_canvas(x: float, z: float):
-            cx = canvas_cx + (x - cx_world) * scale
-            cz = canvas_cz - (z - cz_world) * scale
-            return cx, cz
+        ring_radius = 0.42 * min(canvas_w, canvas_h) * float(self.zoom)
+        ring_radius = max(30.0, float(ring_radius))
 
         node_pos = {}
         node_map = {}
+        node_ids = []
         for n in nodes:
             iid = int(n.get("instance_id", -1))
-            x, z = self._safe_center(n)
-            node_pos[iid] = to_canvas(x, z)
+            if iid < 0:
+                continue
             node_map[iid] = n
+            node_ids.append(iid)
+        node_ids = sorted(set(node_ids))
+
+        n_nodes = max(1, len(node_ids))
+        angle0 = -0.5 * math.pi
+        for idx, iid in enumerate(node_ids):
+            theta = angle0 + (2.0 * math.pi) * (float(idx) / float(n_nodes))
+            x = canvas_cx + math.cos(theta) * ring_radius
+            y = canvas_cy + math.sin(theta) * ring_radius
+            node_pos[iid] = (float(x), float(y))
 
         if self.selected_iid is not None and int(self.selected_iid) not in node_pos:
             self.selected_iid = None
@@ -177,7 +210,8 @@ class SceneGraphWindow:
                     best_d2 = d2
                     hovered_iid = iid
 
-        if canvas_hovered and imgui.is_mouse_clicked(0):
+        # Selection happens on mouse release (if we didn't pan).
+        if canvas_hovered and imgui.is_mouse_released(0) and (not self._drag_is_panning):
             if hovered_iid is None:
                 self.selected_iid = None
             elif self.selected_iid is not None and int(self.selected_iid) == int(hovered_iid):

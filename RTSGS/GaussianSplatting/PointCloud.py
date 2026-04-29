@@ -81,6 +81,10 @@ class PointCloud:
         self.instance_min_points = int(config.get("instance_min_points", 30))
         self.instance_iou_gate = float(config.get("instance_iou_gate", 0.15))
         self.instance_center_gate_m = float(config.get("instance_center_gate_m", 0.30))
+        self.instance_overlap_gate = float(config.get("instance_overlap_gate", 0.12))
+        self.instance_partial_overlap_gate = float(config.get("instance_partial_overlap_gate", 0.08))
+        self.instance_bbox_expand_ratio = float(config.get("instance_bbox_expand_ratio", 0.2))
+        self.instance_merge_min_ratio = float(config.get("instance_merge_min_ratio", 0.2))
         self.instance_max_missed_frames = int(config.get("instance_max_missed_frames", 30))
         self.instance_bbox_quantile = float(config.get("instance_bbox_quantile", 0.03))
         self.instance_bbox_merge_iou = float(config.get("instance_bbox_merge_iou", 0.25))
@@ -593,24 +597,43 @@ class PointCloud:
         self.segmentation_instances = out
 
     def _update_instances_from_predictions(self, pred_instances, n_map: int):
-        self._instance_frame_idx += 1
-        frame_idx = int(self._instance_frame_idx)
+        # Class-level association: each semantic class is represented by one instance
+        # and the instance id is the class id.
+
+        if self.gaussian_instance_ids is None:
+            return
 
         if not isinstance(self.segmentation_instances, list):
             self.segmentation_instances = []
 
-        # Track inactivity for existing instances.
-        by_id = {}
+        # Build an index of existing instances by class id.
+        existing_by_class: dict[int, dict] = {}
         for inst in self.segmentation_instances:
             iid = int(inst.get("instance_id", -1))
-            if iid < 0:
+            cls_id = int(inst.get("class_id", -1))
+            if iid < 0 or cls_id < 0:
                 continue
-            missed = int(inst.get("missed_frames", 0)) + 1
-            inst["missed_frames"] = missed
-            by_id[iid] = inst
+            bmin_list = inst.get("bbox_min", None)
+            bmax_list = inst.get("bbox_max", None)
+            if not isinstance(bmin_list, (list, tuple)) or not isinstance(bmax_list, (list, tuple)):
+                continue
+            if len(bmin_list) != 3 or len(bmax_list) != 3:
+                continue
 
-        candidates = pred_instances if isinstance(pred_instances, list) else []
-        for cand in candidates:
+            ibmin = torch.tensor(bmin_list, device=self.device, dtype=torch.float32)
+            ibmax = torch.tensor(bmax_list, device=self.device, dtype=torch.float32)
+            icenter = 0.5 * (ibmin + ibmax)
+            existing_by_class[cls_id] = {
+                "instance_id": cls_id,
+                "bmin": ibmin,
+                "bmax": ibmax,
+                "center": icenter,
+            }
+
+        # Build candidates (class-centric; every class shares one instance id).
+        candidates = []
+        raw_candidates = pred_instances if isinstance(pred_instances, list) else []
+        for cand in raw_candidates:
             if not isinstance(cand, dict):
                 continue
             if "gaussian_indices" not in cand:
@@ -629,6 +652,8 @@ class PointCloud:
                 continue
 
             cls_id = int(cand.get("class_id", -1))
+            if cls_id < 0:
+                continue
             score = float(cand.get("confidence", 0.0))
 
             box = self._instance_bbox(idx)
@@ -636,87 +661,64 @@ class PointCloud:
                 continue
             bmin, bmax, center = box
 
-            best_id = None
-            best_score = -1.0
-            for inst in self.segmentation_instances:
-                if int(inst.get("class_id", -1)) != cls_id:
-                    continue
-
-                ibmin = torch.tensor(inst.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
-                ibmax = torch.tensor(inst.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
-                icenter = torch.tensor(inst.get("center", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
-
-                iou = self._bbox_iou_3d(bmin, bmax, ibmin, ibmax)
-                dist = float(torch.linalg.norm(center - icenter).item())
-                isize = (ibmax - ibmin).clamp_min(1e-6)
-                csize = (bmax - bmin).clamp_min(1e-6)
-                size_ratio = torch.maximum(csize / isize, isize / csize)
-                size_ratio = float(torch.max(size_ratio).item())
-
-                center_gate = float(self.instance_center_gate_m)
-                close_and_similar = (dist <= center_gate) and (size_ratio <= 2.5)
-                if iou >= float(self.instance_iou_gate) or close_and_similar:
-                    proximity = max(0.0, 1.0 - dist / max(center_gate, 1e-6))
-                    match_score = iou + 0.20 * proximity - 0.05 * max(0.0, size_ratio - 1.0)
-                    if match_score > best_score:
-                        best_score = match_score
-                        best_id = int(inst.get("instance_id", -1))
-
-            if best_id is None or best_id < 0:
-                best_id = int(self._instance_next_id)
-                self._instance_next_id += 1
-                new_inst = {
-                    "instance_id": best_id,
-                    "class_id": cls_id,
+            candidates.append(
+                {
+                    "cand": cand,
+                    "idx": idx,
+                    "cls_id": cls_id,
                     "score": score,
-                    "num_points": int(idx.numel()),
-                    "bbox_min": bmin.detach().cpu().numpy().tolist(),
-                    "bbox_max": bmax.detach().cpu().numpy().tolist(),
-                    "center": center.detach().cpu().numpy().tolist(),
-                    "last_seen_frame": frame_idx,
-                    "missed_frames": 0,
+                    "bmin": bmin,
+                    "bmax": bmax,
+                    "center": center,
                 }
-                self.segmentation_instances.append(new_inst)
-                by_id[best_id] = new_inst
-            else:
-                inst = by_id.get(best_id, None)
-                if inst is None:
-                    continue
-                ibmin = torch.tensor(inst.get("bbox_min", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
-                ibmax = torch.tensor(inst.get("bbox_max", [0.0, 0.0, 0.0]), device=self.device, dtype=torch.float32)
-                # EMA update avoids runaway bbox growth and identity collapse.
-                box_ema = 0.25
-                new_bmin = (1.0 - box_ema) * ibmin + box_ema * bmin
-                new_bmax = (1.0 - box_ema) * ibmax + box_ema * bmax
-                new_center = 0.5 * (new_bmin + new_bmax)
+            )
 
-                inst["bbox_min"] = new_bmin.detach().cpu().numpy().tolist()
-                inst["bbox_max"] = new_bmax.detach().cpu().numpy().tolist()
-                inst["center"] = new_center.detach().cpu().numpy().tolist()
-                inst["score"] = max(float(inst.get("score", 0.0)), score)
-                inst["last_seen_frame"] = frame_idx
-                inst["missed_frames"] = 0
+        # Deterministic tolerance derived from voxel size (not a tunable hyperparameter).
+        eps = float(max(self.voxel_size * 2.0, 1e-3))
+        eps_t = torch.tensor(eps, device=self.device, dtype=torch.float32)
 
-            # Return the chosen tracking id to upstream consumers.
+        # Stronger predictions get first pick on available geometry updates.
+        candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+
+        for c in candidates:
+            cand = c["cand"]
+            idx = c["idx"]
+            cls_id = int(c["cls_id"])
+            center = c["center"].to(dtype=torch.float32)
+            cand_bmin = c["bmin"].to(dtype=torch.float32)
+            cand_bmax = c["bmax"].to(dtype=torch.float32)
+
+            best_id: int | None = int(cls_id)
+
+            # Preserve any existing class-level instance IDs inside this mask.
+            prev_ids_full = self.gaussian_instance_ids[idx]
+            assigned_mask = prev_ids_full >= 0
+            if torch.any(assigned_mask):
+                prev_ids = prev_ids_full[assigned_mask]
+                if prev_ids.numel() > 0:
+                    prev_ids_full[assigned_mask] = int(cls_id)
+            new_idx = idx[~assigned_mask]
+
+            # Ensure the whole candidate is written to the class-level instance id.
             cand["instance_id"] = int(best_id)
+            if new_idx.numel() > 0:
+                self.gaussian_instance_ids[new_idx] = int(best_id)
 
-            self.gaussian_instance_ids[idx] = int(best_id)
-
-        # Purge stale instances and release their point assignments.
-        keep = []
-        for inst in self.segmentation_instances:
-            missed = int(inst.get("missed_frames", 0))
-            if missed <= int(self.instance_max_missed_frames):
-                keep.append(inst)
+            if best_id in existing_by_class:
+                inst = existing_by_class[best_id]
+                # Update the stored class instance with the latest geometry.
+                inst["bmin"] = torch.minimum(inst["bmin"], cand_bmin)
+                inst["bmax"] = torch.maximum(inst["bmax"], cand_bmax)
+                inst["center"] = 0.5 * (inst["bmin"] + inst["bmax"])
             else:
-                iid = int(inst.get("instance_id", -1))
-                if iid >= 0 and self.gaussian_instance_ids is not None:
-                    self.gaussian_instance_ids[self.gaussian_instance_ids == iid] = -1
-        self.segmentation_instances = keep
+                existing_by_class[best_id] = {
+                    "instance_id": int(best_id),
+                    "bmin": cand_bmin,
+                    "bmax": cand_bmax,
+                    "center": center,
+                }
 
-        self._merge_overlapping_instances()
-
-        # Refresh bboxes and counts from current point assignments.
+        # Refresh instance snapshots from current point assignments.
         self._rebuild_instances_snapshot()
 
     def _merge_overlapping_instances(self):

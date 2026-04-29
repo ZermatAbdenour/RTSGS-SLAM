@@ -16,7 +16,7 @@ class YOLOSemanticSegmenter:
 
         self.enabled = bool(config.get("yolo_segmentation_enabled", True))
         self.model_id = str(
-            config.get("mask2former_model_id", config.get("yolo_model_path", "facebook/mask2former-swin-base-ade-semantic"))
+            config.get("mask2former_model_id", config.get("yolo_model_path", "facebook/mask2former-swin-base-coco-panoptic"))
         )
         self.min_confidence = float(config.get("yolo_min_confidence", 0.6))
         self.assignment_confidence_gate = float(config.get("semantic_assignment_min_confidence", 0.4))
@@ -195,6 +195,31 @@ class YOLOSemanticSegmenter:
             out[mask] = 0.4 * out[mask] + 0.6 * color[None, :]
         return np.clip(out, 0, 255).astype(np.uint8)
 
+    @staticmethod
+    def _mask_pool_pixel_features(pixel_features: torch.Tensor, mask_logits: torch.Tensor) -> torch.Tensor:
+        # pixel_features: [1, C, Hf, Wf], mask_logits: [1, Q, Hm, Wm]
+        if mask_logits.shape[-2:] != pixel_features.shape[-2:]:
+            mask_logits = F.interpolate(
+                mask_logits,
+                size=pixel_features.shape[-2:],
+                mode="bilinear",
+                align_corners=False,
+            )
+        masks = torch.sigmoid(mask_logits)
+        masks = masks / (masks.sum(dim=(2, 3), keepdim=True) + 1e-6)
+        pooled = torch.einsum("bchw,bqhw->bqc", pixel_features, masks)
+        return pooled.squeeze(0)
+
+    @staticmethod
+    def _get_feature_map(outputs) -> torch.Tensor | None:
+        feat = getattr(outputs, "mask_features", None)
+        if feat is not None:
+            return feat
+        feat = getattr(outputs, "pixel_decoder_last_hidden_state", None)
+        if feat is not None:
+            return feat
+        return None
+
     @torch.inference_mode()
     def process_frame(self, rgb_bgr: np.ndarray, depth_raw: np.ndarray, pose_w: np.ndarray | None):
         if not self.enabled or rgb_bgr is None or depth_raw is None:
@@ -217,6 +242,23 @@ class YOLOSemanticSegmenter:
         inputs = self._processor(images=rgb_np, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         outputs = self._model(**inputs)
+        feature_map = self._get_feature_map(outputs)
+        if isinstance(feature_map, torch.Tensor):
+            feature_map = feature_map
+
+        query_embeds = getattr(outputs, "transformer_decoder_last_hidden_state", None)
+        if isinstance(query_embeds, torch.Tensor):
+            query_embeds = query_embeds[0]
+        else:
+            query_embeds = None
+
+        mask_logits = getattr(outputs, "masks_queries_logits", None)
+        if not isinstance(mask_logits, torch.Tensor):
+            mask_logits = None
+
+        pooled_pixel_features = None
+        if isinstance(feature_map, torch.Tensor) and isinstance(mask_logits, torch.Tensor):
+            pooled_pixel_features = self._mask_pool_pixel_features(feature_map, mask_logits)
 
         t_post0 = time.perf_counter()
         panoptic = self._processor.post_process_panoptic_segmentation(
@@ -416,6 +458,10 @@ class YOLOSemanticSegmenter:
         obs_conf = []
         pred_instances = []
 
+        mask_query_scores = None
+        if isinstance(mask_logits, torch.Tensor):
+            mask_query_scores = torch.sigmoid(mask_logits[0])
+
         t_match0 = time.perf_counter()
         for seg_id_t in torch.unique(seg_ids_at_gauss).tolist():
             seg_id = int(seg_id_t)
@@ -444,6 +490,27 @@ class YOLOSemanticSegmenter:
             if g_idx.numel() == 0:
                 continue
 
+            obj_feature = None
+            if (
+                isinstance(mask_query_scores, torch.Tensor)
+                and isinstance(query_embeds, torch.Tensor)
+                and isinstance(pooled_pixel_features, torch.Tensor)
+            ):
+                mask_full = segmentation == seg_id
+                if np.any(mask_full):
+                    mask_t = torch.from_numpy(mask_full.astype(np.float32)).to(self.device)
+                    mask_t = mask_t.unsqueeze(0).unsqueeze(0)
+                    mh, mw = int(mask_query_scores.shape[-2]), int(mask_query_scores.shape[-1])
+                    mask_small = F.interpolate(mask_t, size=(mh, mw), mode="bilinear", align_corners=False)[0, 0]
+                    mask_sum = float(mask_small.sum().item())
+                    if mask_sum > 1e-6:
+                        q_scores = (mask_query_scores * mask_small).sum(dim=(1, 2)) / mask_sum
+                        best_q = int(torch.argmax(q_scores).item())
+                        obj_feature = torch.cat(
+                            [query_embeds[best_q], pooled_pixel_features[best_q]],
+                            dim=-1,
+                        )
+
             ranked_segments.append(seg)
             obs_idx.append(g_idx)
             obs_cls.append(torch.full_like(g_idx, int(local_class_id), dtype=torch.long, device=self.device))
@@ -452,8 +519,10 @@ class YOLOSemanticSegmenter:
                 {
                     "seg_id": int(seg_id),
                     "class_id": int(local_class_id),
+                    "instance_id": int(local_class_id),
                     "confidence": float(seg_score),
                     "gaussian_indices": g_idx,
+                    "object_feature": obj_feature,
                 }
             )
 
@@ -513,12 +582,18 @@ class YOLOSemanticSegmenter:
                 [p for p in pred_instances if isinstance(p, dict)],
                 key=lambda p: float(p.get("confidence", 0.0)),
                 reverse=True,
-            )[: max(0, int(self.scenegraph_max_objects_per_keyframe))]
+            )
+            max_per_frame = int(self.scenegraph_max_objects_per_keyframe)
+            if max_per_frame > 0:
+                ranked_pred = ranked_pred[:max_per_frame]
 
             for pred in ranked_pred:
                 seg_id = int(pred.get("seg_id", -1))
                 inst_id = int(pred.get("instance_id", -1))
+                if inst_id < 0:
+                    inst_id = int(pred.get("class_id", -1))
                 g_idx = pred.get("gaussian_indices", None)
+                obj_feat = pred.get("object_feature", None)
                 if seg_id < 0 or g_idx is None:
                     continue
                 if not isinstance(g_idx, torch.Tensor):
@@ -581,6 +656,7 @@ class YOLOSemanticSegmenter:
                         "bbox_max": bmax.detach().cpu().numpy().tolist(),
                         "obb": obb,
                         "dominantNormal": dominant_normal,
+                        "object_feature": obj_feat.detach().cpu().float().tolist() if isinstance(obj_feat, torch.Tensor) else obj_feat,
                         "crop_bgr": crop,
                     }
                 )

@@ -1,7 +1,6 @@
 /rgbd_dataset_freiburg3_long_office_household/
 Replica/habitat_capture/
 ScanNet/
-3RScan/download.py
 3DSSG/3DSSG
-3rscan
-3rscan_full_data
+/3RScan/3RScan
+/3RScan/download.py

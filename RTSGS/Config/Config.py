@@ -41,8 +41,8 @@ class Config:
 
             # Per-frame Mask2Former panoptic semantic fusion.
             self.config_dict.setdefault("yolo_segmentation_enabled", True)
-            self.config_dict.setdefault("mask2former_model_id", "facebook/mask2former-swin-base-ade-semantic")
-            self.config_dict.setdefault("yolo_model_path", "facebook/mask2former-swin-base-ade-semantic")
+            self.config_dict.setdefault("mask2former_model_id", "facebook/mask2former-swin-large-ade-panoptic")
+            self.config_dict.setdefault("yolo_model_path", "facebook/mask2former-swin-large-ade-panoptic")
             self.config_dict.setdefault("yolo_min_confidence", 0.25)
             self.config_dict.setdefault("semantic_assignment_min_confidence", 0.4)
             self.config_dict.setdefault("yolo_max_detections", 64)
@@ -57,19 +57,31 @@ class Config:
             self.config_dict.setdefault("semantic_cull_near", 0.05)
             self.config_dict.setdefault("semantic_cull_far", 50.0)
             self.config_dict.setdefault("semantic_cull_pad_px", 2.0)
+            self.config_dict.setdefault("instance_overlap_gate", 0.12)
+            self.config_dict.setdefault("instance_partial_overlap_gate", 0.08)
+            self.config_dict.setdefault("instance_bbox_merge_iou", 0.05)
+            self.config_dict.setdefault("instance_bbox_expand_ratio", 0.2)
+            self.config_dict.setdefault("instance_merge_min_ratio", 0.2)
 
-            # Real-time scene graph: masked segment -> CLIP -> residual -> MP-GNN.
+            # Real-time scene graph: Mask2Former -> RelationHead -> global MP-GNN.
             self.config_dict.setdefault("scenegraph_enabled", True)
-            self.config_dict.setdefault("scenegraph_clip_model_name", "ViT-B/32")
-            self.config_dict.setdefault("scenegraph_max_objects_per_keyframe", 12)
+            self.config_dict.setdefault("scenegraph_max_objects_per_keyframe", 0)
             self.config_dict.setdefault("scenegraph_update_stride", 1)
             self.config_dict.setdefault("scenegraph_max_nodes", 48)
             self.config_dict.setdefault("scenegraph_max_relations", 256)
             self.config_dict.setdefault("scenegraph_rel_threshold", 0.5)
-            self.config_dict.setdefault("scenegraph_knn_k", 6)
+            self.config_dict.setdefault("scenegraph_relation_persist", True)
+            self.config_dict.setdefault("scenegraph_relation_ttl", 10)
             self.config_dict.setdefault("scenegraph_instance_ttl", 30)
-            self.config_dict.setdefault("scenegraph_residual_checkpoint", "SceneGraph/checkpoints/temporal_residual/best.pt")
-            self.config_dict.setdefault("scenegraph_gnn_checkpoint", "SceneGraph/checkpoints/scenegraph_multiscan/best.pt")
+            self.config_dict.setdefault("scenegraph_instance_merge_dist", 0.6)
+            self.config_dict.setdefault(
+                "scenegraph_relation_head_checkpoint",
+                "Datasets/3RScan/3RScan/data/scans/relation_branch_hard_negative_bce.pt",
+            )
+            self.config_dict.setdefault(
+                "scenegraph_mpgnn_checkpoint",
+                "Datasets/3RScan/3RScan/data/scans/global_scene_graph_mpgnn.pt",
+            )
             self.config_dict.setdefault("scenegraph_relationships_path", "Datasets/3DSSG/3DSSG/relationships.txt")
             self.config_dict.setdefault("scenegraph_min_mask_pixels", 200)
 
