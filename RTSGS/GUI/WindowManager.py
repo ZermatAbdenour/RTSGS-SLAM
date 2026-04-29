@@ -8,6 +8,7 @@ from RTSGS.GUI.ProfilerWindow import ProfilerWindow
 from RTSGS.GUI.GaussianSplattingWindow import GaussianSplattingWindow
 from RTSGS.GUI.SegmentationLegendWindow import SegmentationLegendWindow
 from RTSGS.GUI.SceneGraphWindow import SceneGraphWindow
+from RTSGS.GUI.BenchmarkWindow import BenchmarkWindow
 from RTSGS.GaussianSplatting.PointCloud import PointCloud
 from RTSGS.GaussianSplatting.GaussianSplating import GaussianSplatting
 from RTSGS.GaussianSplatting.Renderer.OpenGLRenderer import Renderer
@@ -65,15 +66,25 @@ class WindowManager:
         # windows
         self.performance_window = PerformanceWindow()
         self.profiler_window = ProfilerWindow()
+        # keep reference to GaussianSplatting instance and expose to performance window
+        self.gs = gs
+        self.performance_window.gs = gs
         camera = Camera()
         self.opengl_renderer = Renderer(point_cloud, camera, tracker=tracker, dataset=dataset)
         self.viewport_window = ViewportWindow(self.opengl_renderer)
         self.gaussian_splating_window = GaussianSplattingWindow(point_cloud,camera)
         self.segmentation_legend_window = SegmentationLegendWindow(point_cloud, self.opengl_renderer)
         self.scene_graph_window = SceneGraphWindow(point_cloud)
+        # Benchmark window (created on demand via enable_benchmark_window)
+        self.benchmark_window = None
         #time
         self._last_time = None
         self._delta_time = 0.016
+
+    def enable_benchmark_window(self, gs, dataset):
+        """Create the benchmark window (on-demand)."""
+        if self.benchmark_window is None:
+            self.benchmark_window = BenchmarkWindow(gs, dataset)
 
     def _on_window_resize(self, window, width, height):
         self.width = max(1, int(width))
@@ -101,6 +112,11 @@ class WindowManager:
                 clicked, _ = imgui.menu_item("Scene Graph", "", self.scene_graph_window.is_open, True)
                 if clicked:
                     self.scene_graph_window.is_open = not self.scene_graph_window.is_open
+                # Benchmark menu item only if available
+                if self.benchmark_window is not None:
+                    clicked, _ = imgui.menu_item("Benchmark", "", self.benchmark_window.is_open, True)
+                    if clicked:
+                        self.benchmark_window.is_open = not self.benchmark_window.is_open
                 imgui.end_menu()
 
             imgui.end_main_menu_bar()
@@ -157,6 +173,9 @@ class WindowManager:
 
         if self.scene_graph_window.is_open:
             self.scene_graph_window.draw()
+        # Benchmark window (optional)
+        if self.benchmark_window is not None and self.benchmark_window.is_open:
+            self.benchmark_window.draw()
 
     def render_frame(self):
         self.update_delta_time()

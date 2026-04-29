@@ -68,11 +68,18 @@ class RTSGSSystem:
         self.last_added_keyframe_idx = -1
 
 
-    def run(self):
+    def run(self, benchmark: bool = False):
         self._worker.start()
         self._seg_worker.start()
         self.segmenter.start()
         self.scene_graph.start()
+
+        # Enable benchmark window if requested
+        if benchmark:
+            try:
+                self.window.enable_benchmark_window(self.gs, self.dataset)
+            except Exception:
+                pass
 
         while not self.window.window_should_close():
             self.window.start_frame()

@@ -100,6 +100,14 @@ class PerformanceWindow:
 
         imgui.text(f"FPS: {self.stats.fps:6.1f}")
         imgui.text(f"Frame time: {self.stats.frame_ms:6.2f} ms")
+        # Gaussian Splatting optimization steps/sec (if available)
+        gs = getattr(self, 'gs', None)
+        if gs is not None:
+            try:
+                sps = float(getattr(gs, 'steps_per_sec', 0.0))
+                imgui.text(f"GS steps/s: {sps:6.1f}")
+            except Exception:
+                pass
 
         imgui.separator()
         imgui.text("Python memory (tracemalloc)")

@@ -50,4 +50,4 @@ if __name__ == "__main__":
     # Initialize System
     system = RTSGSSystem(data,tracker,config)
 
-    system.run()
+    system.run(benchmark=True)

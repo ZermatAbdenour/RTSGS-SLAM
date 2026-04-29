@@ -1,4 +1,5 @@
 import time
+from collections import deque
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -98,7 +99,7 @@ def frustum_cull_mask(
 
 
 class GaussianSplatting:
-    def __init__(self, pcd, dataset, tracker, learning_rate=4e-4, max_steps_per_sec=1000, downsample_factor=2.0):
+    def __init__(self, pcd, dataset, tracker, learning_rate=4e-4, max_steps_per_sec=1000, downsample_factor=1.0):
         self.pcd = pcd
         self.dataset = dataset
         self.device = pcd.device
@@ -134,6 +135,9 @@ class GaussianSplatting:
         self.cull_far = 50.0
         self.cull_pad_px = 4.0
         self.min_culled_points = 2048  # avoid pathological tiny sets
+        # Step rate tracking (timestamps of recent optimizer steps)
+        self._step_timestamps = deque()
+        self.steps_per_sec = 0.0
 
     @torch.no_grad()
     def render_depth_at_pose(self, pose_np: np.ndarray):
@@ -199,6 +203,63 @@ class GaussianSplatting:
         depth[~np.isfinite(depth)] = 0.0
         depth[depth < 0.0] = 0.0
         return depth
+
+    @torch.no_grad()
+    def render_rgb_at_pose(self, pose_np: np.ndarray):
+        """
+        Render RGB image (uint8 HxWx3) for a given camera pose (world-from-camera 4x4).
+        Returns numpy uint8 array or None on failure.
+        """
+        if self.pcd.all_points is None:
+            return None
+
+        if pose_np is None:
+            return None
+
+        means = self.pcd.all_points
+        quats = self.pcd.all_quaternions
+        scales = self.pcd.all_scales
+        alpha = self.pcd.all_alpha
+        sh = self.pcd.all_sh
+
+        if means is None or means.shape[0] == 0:
+            return None
+
+        pose = torch.from_numpy(np.asarray(pose_np, dtype=np.float32)).to(self.device)
+
+        T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        T_fix[:3, :3] = self.pcd.R_fix
+        viewmat = torch.inverse(T_fix @ pose).unsqueeze(0)
+
+        K = _build_K(
+            fx=float(self.pcd.rgb_fx),
+            fy=float(self.pcd.rgb_fy),
+            cx=float(self.pcd.rgb_cx),
+            cy=float(self.pcd.rgb_cy),
+            device=self.device,
+        ).unsqueeze(0)
+
+        try:
+            img, _, _ = rendering.rasterization(
+                means=means,
+                quats=F.normalize(quats, p=2, dim=-1),
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(alpha).squeeze(-1),
+                colors=(torch.sigmoid(spherical_harmonics(self.pcd.sh_degree, (means - ((T_fix @ pose)[:3,3]).to(self.device)), sh)) if sh is not None else torch.ones((means.shape[0],3), device=self.device)),
+                viewmats=viewmat,
+                Ks=K,
+                width=self.rgb_width,
+                height=self.rgb_height,
+                render_mode="RGB",
+            )
+        except Exception:
+            return None
+
+        try:
+            out = (img[0].clamp_(0.0, 1.0).mul_(255.0)).to(torch.uint8).cpu().numpy()
+            return out
+        except Exception:
+            return None
 
     def _setup_optimizer(self):
         if self.pcd.all_points is None:
@@ -458,12 +519,12 @@ class GaussianSplatting:
 
         # 6) Loss/backward
         l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
-        ssim_val = ssim(
-            rendered_rgb.permute(0, 3, 1, 2),
-            gt_rgbs.permute(0, 3, 1, 2),
-            data_range=1.0
-        )
-        rgb_loss = 0.8 * l1_loss + 0.2 * (1.0 - ssim_val)
+        # ssim_val = ssim(
+        #     rendered_rgb.permute(0, 3, 1, 2),
+        #     gt_rgbs.permute(0, 3, 1, 2),
+        #     data_range=1.0
+        # )
+        rgb_loss = l1_loss #+ 0.2 * (1.0 - ssim_val)
 
         depth_loss = torch.zeros((), device=self.device)
         if gt_depths is not None and rendered_depth is not None:
@@ -480,7 +541,15 @@ class GaussianSplatting:
         if total_loss > 0:
             total_loss.backward()
             self.optimizer.step()
-
+            # record a performed optimization step timestamp and compute recent rate
+       
+            now = time.time()
+            self._step_timestamps.append(now)
+            # drop older than 1s
+            cutoff = now - 1.0
+            while self._step_timestamps and self._step_timestamps[0] < cutoff:
+                self._step_timestamps.popleft()
+            self.steps_per_sec = float(len(self._step_timestamps))
         # 7) Densify
         if self.iteration_count > self.densify_start_iter and self.iteration_count % self.densify_interval == 0:
             self.densify()
