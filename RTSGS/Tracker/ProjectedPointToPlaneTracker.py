@@ -35,17 +35,17 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.alpha = float(config.get("kf_translation", 0.05))
         self.theta = float(config.get("kf_rotation", 5.0 * np.pi / 180.0))
 
-        self.icp_stride = int(config.get("icp_stride", 4))
+        self.icp_stride = int(config.get("icp_stride", 2))
         self.icp_max_iters = int(config.get("icp_max_iters", 12))
-        self.icp_corr_dist = float(config.get("icp_corr_dist", 0.12))
+        self.icp_corr_dist = float(config.get("icp_corr_dist", 0.01))
         self.icp_huber_delta = float(config.get("icp_huber_delta", 0.02))
         self.icp_damping = float(config.get("icp_damping", 1e-5))
         self.icp_use_projective = bool(config.get("icp_use_projective", True))
         self.depth_min = float(config.get("depth_min", 0.10))
         self.depth_max = float(config.get("depth_max", 8.0))
 
-        self.depth_median_ksize = int(config.get("depth_median_ksize", 5))
-        self.depth_bilateral_d = int(config.get("depth_bilateral_d", 5))
+        self.depth_median_ksize = int(config.get("depth_median_ksize", 1))
+        self.depth_bilateral_d = int(config.get("depth_bilateral_d", 1))
         self.depth_bilateral_sigma_color = float(config.get("depth_bilateral_sigma_color", 0.04))
         self.depth_bilateral_sigma_space = float(config.get("depth_bilateral_sigma_space", 2.0))
 

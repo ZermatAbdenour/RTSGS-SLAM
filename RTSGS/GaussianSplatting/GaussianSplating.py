@@ -18,7 +18,7 @@ class TokenBucket:
     def __init__(self, rate: float, burst: float = 1.0):
         self.rate = float(rate)
         self.burst = float(burst)
-        self.tokens = 0.0
+        self.tokens = self.burst
         self.last_t = time.time()
 
     def allow(self, cost: float = 1.0) -> bool:
@@ -277,8 +277,8 @@ class GaussianSplatting:
         params = [
             {'params': [self.pcd.all_points], 'lr': self.base_lr * self.points_lr_mult, "name": "points"},
             {'params': [self.pcd.all_sh], 'lr': self.base_lr * 3.0, "name": "sh"},
-            {'params': [self.pcd.all_scales], 'lr': self.base_lr * 3.0, "name": "scales"},
-            {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 1.0, "name": "quats"},
+            {'params': [self.pcd.all_scales], 'lr': self.base_lr * 10.0, "name": "scales"},
+            {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 10.0, "name": "quats"},
             {'params': [self.pcd.all_alpha], 'lr': self.base_lr, "name": "alphas"},
         ]
         self.optimizer = torch.optim.Adam(params)
@@ -394,8 +394,26 @@ class GaussianSplatting:
         R_fix = self.pcd.R_fix
 
         kf_count = len(self.tracker.keyframes_poses)
-        b = 2 if kf_count >= 2 else 1
-        sample_idx = np.random.choice(kf_count, b, replace=False)
+
+        # always include newest keyframe + random old keyframes
+        # number of frames to use
+        b = min(2, kf_count)
+
+        # always start with newest frame
+        latest_idx = kf_count - 1
+
+        if b == 1:
+            sample_idx = np.array([latest_idx])
+
+        else:
+            if np.random.rand() < 0.8:
+                # 80%: only optimize latest frame (fast convergence)
+                sample_idx = np.array([latest_idx])
+            else:
+                # 20%: latest + one random older frame
+                old_idx = np.random.choice(kf_count - 1, 1, replace=False)
+                sample_idx = np.concatenate(([latest_idx], old_idx))
+        b = len(sample_idx)
         gt_rgb_np = [self.dataset.rgb_keyframes[i] for i in sample_idx]
         can_use_depth = (
             self.depth_loss_weight > 0.0
@@ -451,34 +469,30 @@ class GaussianSplatting:
         )
         Ks = K.unsqueeze(0).expand(b, -1, -1)
 
-        # FRUSTUM CULL (before SH + rasterization)
-        mask = frustum_cull_mask(
-            means_world=means_all,
-            viewmats=viewmats,
-            Ks=Ks,
-            width=self.train_width,
-            height=self.train_height,
-            near=self.cull_near,
-            far=self.cull_far,
-            pad=self.cull_pad_px,
-        )
+        # 3) Frustum culling
+        with torch.no_grad():
+            cull_mask = frustum_cull_mask(
+                means_world=means_all.detach(),
+                viewmats=viewmats.detach(),
+                Ks=Ks.detach(),
+                width=self.train_width,
+                height=self.train_height,
+                near=self.cull_near,
+                far=self.cull_far,
+                pad=self.cull_pad_px,
+            )
 
-        # Ensure we don't end up with too few points
-        n_keep = int(mask.sum().item())
-        if n_keep < self.min_culled_points:
-            means = means_all
-            sh = sh_all
-            scales = scales_all
-            quats = quats_all
-            alpha = alpha_all
-            culled_idx = None
-        else:
-            culled_idx = torch.nonzero(mask, as_tuple=False).squeeze(1)
-            means = means_all[culled_idx]
-            sh = sh_all[culled_idx]
-            scales = scales_all[culled_idx]
-            quats = quats_all[culled_idx]
-            alpha = alpha_all[culled_idx]
+            # Avoid too small set
+            if cull_mask.sum() < self.min_culled_points:
+                cull_mask = torch.ones_like(cull_mask, dtype=torch.bool)
+
+        idx = torch.where(cull_mask)[0]
+
+        means = means_all[idx]
+        sh = sh_all[idx]
+        scales = scales_all[idx]
+        quats = quats_all[idx]
+        alpha = alpha_all[idx]
 
         # 4) SH colors on culled set
         dirs = means.unsqueeze(0) - cam_centers.unsqueeze(1)
@@ -488,31 +502,20 @@ class GaussianSplatting:
         colors = torch.sigmoid(spherical_harmonics(sh_degree, dirs, sh_coeffs))
 
         # 5) Rasterization on culled set
-        try:
-            rendered, _, info = rendering.rasterization(
-                means=means,
-                quats=F.normalize(quats, p=2, dim=-1),
-                scales=torch.exp(scales),
-                opacities=torch.sigmoid(alpha).squeeze(-1),
-                colors=colors,
-                viewmats=viewmats,
-                Ks=Ks,
-                width=self.train_width,
-                height=self.train_height,
-                render_mode="RGB+ED",
-            )
-        except Exception:
-            rendered, _, info = rendering.rasterization(
-                means=means,
-                quats=F.normalize(quats, p=2, dim=-1),
-                scales=torch.exp(scales),
-                opacities=torch.sigmoid(alpha).squeeze(-1),
-                colors=colors,
-                viewmats=viewmats,
-                Ks=Ks,
-                width=self.train_width,
-                height=self.train_height,
-            )
+
+        rendered, _, info = rendering.rasterization(
+            means=means,
+            quats=F.normalize(quats, p=2, dim=-1),
+            scales=torch.exp(scales),
+            opacities=torch.sigmoid(alpha).squeeze(-1),
+            colors=colors,
+            viewmats=viewmats,
+            Ks=Ks,
+            width=self.train_width,
+            height=self.train_height,
+            render_mode="RGB+ED",
+        )
+
 
         rendered_rgb = rendered[..., :3]
         rendered_depth = rendered[..., 3] if rendered.shape[-1] > 3 else None
