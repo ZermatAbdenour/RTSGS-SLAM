@@ -39,6 +39,14 @@ class Config:
             self.config_dict.setdefault("gs_depth_huber_delta", 0.05)
             self.config_dict.setdefault("use_rendered_depth_icp", True)
 
+            # Keyframe-to-keyframe tracking gate.
+            self.config_dict.setdefault("kf_depth_change_threshold_m", 0.03)
+            self.config_dict.setdefault("kf_photometric_change_threshold", 0.08)
+            self.config_dict.setdefault("kf_depth_min_coverage", 0.10)
+            self.config_dict.setdefault("kf_min_frame_gap", 1)
+            self.config_dict.setdefault("kf_max_frame_gap", 30)
+            self.config_dict.setdefault("kf_require_both_signals", True)
+
             # Per-frame Mask2Former panoptic semantic fusion.
             self.config_dict.setdefault("yolo_segmentation_enabled", True)
             self.config_dict.setdefault("mask2former_model_id", "facebook/mask2former-swin-large-ade-panoptic")

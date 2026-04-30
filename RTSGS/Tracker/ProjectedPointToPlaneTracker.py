@@ -64,9 +64,28 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.prev_rel_T = torch.eye(4, dtype=torch.float32, device=self.device)
         self.rendered_depth_provider = None
         self.use_rendered_depth_icp = bool(config.get("use_rendered_depth_icp", True))
+        self.rendered_rgb_provider = None
         self.last_ref_depth_source = "prev"
         self.last_rendered_depth_m: np.ndarray | None = None
         self.keyframes_rendered_depth_m = []
+
+        # Keyframe-to-keyframe gating based on rendered/reference disagreement.
+        self.kf_depth_change_threshold_m = float(config.get("kf_depth_change_threshold_m", 0.03))
+        self.kf_photometric_change_threshold = float(config.get("kf_photometric_change_threshold", 0.08))
+        self.kf_depth_min_coverage = float(config.get("kf_depth_min_coverage", 0.10))
+        self.kf_min_frame_gap = int(config.get("kf_min_frame_gap", 1))
+        self.kf_max_frame_gap = int(config.get("kf_max_frame_gap", 30))
+        self.kf_require_both_signals = bool(config.get("kf_require_both_signals", True))
+
+        self._frame_index = -1
+        self._last_keyframe_frame_index = -1
+        self.last_keyframe_depth_m: np.ndarray | None = None
+        self.last_keyframe_gray_u8: np.ndarray | None = None
+
+        self.last_depth_change_m = 0.0
+        self.last_photo_change = 0.0
+        self.last_depth_overlap = 0.0
+        self.last_change_decision = "init"
 
         self.viz_img = None
         self.img_window = None
@@ -84,6 +103,8 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.metrics_csv_path = os.path.join(project_root, "logs", "trajectory_metrics.csv")
 
     def track_frame(self, rgb, depth=None):
+        self._frame_index += 1
+
         if depth is None:
             self.prev_rgb = rgb
             return None
@@ -96,6 +117,13 @@ class ProjectedPointToPlaneTracker(Tracker):
             self.prev_rgb = rgb
             self.viz_img = self._make_tracking_debug_image(rgb, depth_m, depth_m, "init")
             init_pose = self.poses[0].astype(np.float32)
+            self.last_keyframe_depth_m = depth_m.copy()
+            self.last_keyframe_gray_u8 = self._to_gray_u8(rgb)
+            self._last_keyframe_frame_index = self._frame_index
+            self.last_depth_change_m = 0.0
+            self.last_photo_change = 0.0
+            self.last_depth_overlap = 1.0
+            self.last_change_decision = "seed"
             if self.dataset is not None:
                 self.dataset.rgb_keyframes.append(rgb)
                 self.dataset.depth_keyframes.append(depth)
@@ -106,62 +134,77 @@ class ProjectedPointToPlaneTracker(Tracker):
                 self.dataset.current_keyframe_index += 1
             return None
 
-        # Enforce rendered-depth reference path on every frame.
-        ref_depth_m = np.zeros_like(depth_m, dtype=np.float32)
-        self.last_ref_depth_source = "rendered"
-
-        if self.rendered_depth_provider is not None and len(self.poses) > 0:
-            try:
-                rendered_depth = self.rendered_depth_provider(self.poses[-1])
-            except Exception:
-                rendered_depth = None
-
-            if rendered_depth is not None:
-                rendered_depth = np.asarray(rendered_depth, dtype=np.float32)
-                if rendered_depth.shape != depth_m.shape:
-                    rendered_depth = cv2.resize(
-                        rendered_depth,
-                        (depth_m.shape[1], depth_m.shape[0]),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-
-                rendered_depth = self._preprocess_depth(rendered_depth)
-                self.last_rendered_depth_m = rendered_depth
-                ref_depth_m = rendered_depth
-
+        # Build references from the last accepted keyframe pose.
+        ref_pose = self.keyframes_poses[-1] if len(self.keyframes_poses) > 0 else self.poses[-1]
+        ref_depth_m, depth_ref_source, ref_rgb = self._build_reference_views(depth_m, ref_pose)
+        self.last_ref_depth_source = depth_ref_source
         self.last_rendered_depth_m = ref_depth_m
 
-        T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, self.prev_rel_T)
+        depth_change_m, photo_change, overlap = self._compute_change_signals(
+            cur_depth_m=depth_m,
+            ref_depth_m=ref_depth_m,
+            cur_rgb=rgb,
+            ref_rgb=ref_rgb,
+        )
+        self.last_depth_change_m = float(depth_change_m)
+        self.last_photo_change = float(photo_change)
+        self.last_depth_overlap = float(overlap)
+
+        frames_since_kf = self._frame_index - self._last_keyframe_frame_index
+        depth_trigger = depth_change_m >= self.kf_depth_change_threshold_m
+        photo_trigger = photo_change >= self.kf_photometric_change_threshold
+        if self.kf_require_both_signals:
+            change_trigger = depth_trigger and photo_trigger
+        else:
+            change_trigger = depth_trigger or photo_trigger
+
+        should_add_keyframe = (
+            frames_since_kf >= self.kf_min_frame_gap
+            and (change_trigger or frames_since_kf >= self.kf_max_frame_gap)
+        )
+
+        if not should_add_keyframe:
+            self.last_change_decision = "skip"
+            # Keep dense trajectory history for plotting/metrics across all frames.
+            self.poses.append(self.poses[-1].copy())
+            self.prev_depth_m = depth_m
+            self.prev_rgb = rgb
+            self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
+            return None
+
+        # Keyframe-to-keyframe tracking: estimate only when the frame is promoted.
+        T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, torch.eye(4, dtype=torch.float32, device=self.device))
         self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
         if T_rel is None:
+            self.last_change_decision = "icp-fail"
+            self.poses.append(self.poses[-1].copy())
             self.prev_depth_m = depth_m
             self.prev_rgb = rgb
             return None
 
         T_rel_np = T_rel.detach().cpu().numpy().astype(np.float32)
-        pose = self.poses[-1] @ np.linalg.inv(T_rel_np)
-        self.poses.append(pose.astype(np.float32))
-        self.prev_rel_T = T_rel.detach()
+        pose = ref_pose @ np.linalg.inv(T_rel_np)
+        pose = pose.astype(np.float32)
 
-        is_keyframe = False
-        if self.last_kf_pose is None:
-            is_keyframe = True
-        else:
-            dt, dR = self._pose_distance(self.last_kf_pose, pose)
-            if dt > self.alpha or dR > self.theta:
-                is_keyframe = True
+        self.poses.append(pose)
+        self.prev_rel_T = torch.eye(4, dtype=torch.float32, device=self.device)
 
-        if is_keyframe and self.dataset is not None:
+        if self.dataset is not None:
             self.dataset.rgb_keyframes.append(rgb)
             self.dataset.depth_keyframes.append(depth)
-            self.keyframes_poses.append(pose.astype(np.float32))
-            self.keyframe_frame_indices.append(len(self.poses) - 1)
+            self.keyframes_poses.append(pose)
+            self.keyframe_frame_indices.append(self._frame_index)
             if self.last_rendered_depth_m is None:
                 self.keyframes_rendered_depth_m.append(None)
             else:
                 self.keyframes_rendered_depth_m.append(self.last_rendered_depth_m.copy())
             self.last_kf_pose = pose
             self.dataset.current_keyframe_index += 1
+
+        self.last_keyframe_depth_m = depth_m.copy()
+        self.last_keyframe_gray_u8 = self._to_gray_u8(rgb)
+        self._last_keyframe_frame_index = self._frame_index
+        self.last_change_decision = "accept"
 
         self.prev_depth_m = depth_m
         self.prev_rgb = rgb
@@ -170,6 +213,10 @@ class ProjectedPointToPlaneTracker(Tracker):
     def set_rendered_depth_provider(self, provider):
         """Set callable provider: provider(pose_4x4_np) -> depth_m (H,W) or None."""
         self.rendered_depth_provider = provider
+
+    def set_rendered_rgb_provider(self, provider):
+        """Set callable provider: provider(pose_4x4_np) -> rgb uint8 (H,W,3) or None."""
+        self.rendered_rgb_provider = provider
 
     def visualize_tracking(self):
         if self.viz_img is None:
@@ -205,6 +252,11 @@ class ProjectedPointToPlaneTracker(Tracker):
         imgui.text(f"Last ICP iterations: {self.last_icp_iterations}")
         imgui.text(f"Last ICP RMSE: {self.last_icp_rmse:.5f} m")
         imgui.text(f"Ref depth source: {self.last_ref_depth_source}")
+        imgui.text(
+            f"KF gate: depth={self.last_depth_change_m:.4f} m, "
+            f"photo={self.last_photo_change:.4f}, overlap={self.last_depth_overlap:.3f}, "
+            f"decision={self.last_change_decision}"
+        )
 
         if self.dataset is not None and getattr(self.dataset, "time_stamps", None) is not None and self.dataset.time_stamps.shape[0] > 1:
             fps = self.dataset.time_stamps.shape[0] / (self.dataset.time_stamps[-1] - self.dataset.time_stamps[0])
@@ -965,6 +1017,88 @@ class ProjectedPointToPlaneTracker(Tracker):
             img[~valid] = 0
 
         return cv2.applyColorMap(img, cv2.COLORMAP_TURBO)
+
+    def _build_reference_views(self, cur_depth_m: np.ndarray, ref_pose: np.ndarray):
+        ref_depth_m = None
+        ref_rgb = None
+        depth_source = "keyframe"
+
+        if self.rendered_depth_provider is not None:
+            try:
+                rendered_depth = self.rendered_depth_provider(ref_pose)
+            except Exception:
+                rendered_depth = None
+            if rendered_depth is not None:
+                ref_depth_m = np.asarray(rendered_depth, dtype=np.float32)
+                if ref_depth_m.shape != cur_depth_m.shape:
+                    ref_depth_m = cv2.resize(
+                        ref_depth_m,
+                        (cur_depth_m.shape[1], cur_depth_m.shape[0]),
+                        interpolation=cv2.INTER_NEAREST,
+                    )
+                ref_depth_m = self._preprocess_depth(ref_depth_m)
+                depth_source = "rendered"
+
+        if ref_depth_m is None:
+            if self.last_keyframe_depth_m is not None:
+                ref_depth_m = self.last_keyframe_depth_m.copy()
+            else:
+                ref_depth_m = np.zeros_like(cur_depth_m, dtype=np.float32)
+
+        if self.rendered_rgb_provider is not None:
+            try:
+                rendered_rgb = self.rendered_rgb_provider(ref_pose)
+            except Exception:
+                rendered_rgb = None
+            if rendered_rgb is not None:
+                ref_rgb = np.asarray(rendered_rgb)
+
+        if ref_rgb is None and self.last_keyframe_gray_u8 is not None:
+            ref_rgb = self.last_keyframe_gray_u8
+
+        return ref_depth_m, depth_source, ref_rgb
+
+    def _compute_change_signals(self, cur_depth_m: np.ndarray, ref_depth_m: np.ndarray, cur_rgb, ref_rgb):
+        cur_d = np.asarray(cur_depth_m, dtype=np.float32)
+        ref_d = np.asarray(ref_depth_m, dtype=np.float32)
+
+        if ref_d.shape != cur_d.shape:
+            ref_d = cv2.resize(ref_d, (cur_d.shape[1], cur_d.shape[0]), interpolation=cv2.INTER_NEAREST)
+
+        valid_cur = np.isfinite(cur_d) & (cur_d > self.depth_min) & (cur_d < self.depth_max)
+        valid_ref = np.isfinite(ref_d) & (ref_d > self.depth_min) & (ref_d < self.depth_max)
+        valid = valid_cur & valid_ref
+        overlap = float(np.mean(valid))
+
+        if overlap >= self.kf_depth_min_coverage and np.any(valid):
+            depth_change = float(np.mean(np.abs(cur_d[valid] - ref_d[valid])))
+        else:
+            depth_change = float("inf")
+
+        cur_gray = self._to_gray_u8(cur_rgb)
+        ref_gray = self._to_gray_u8(ref_rgb)
+        if ref_gray is None:
+            photo_change = 1.0
+        else:
+            if ref_gray.shape != cur_gray.shape:
+                ref_gray = cv2.resize(ref_gray, (cur_gray.shape[1], cur_gray.shape[0]), interpolation=cv2.INTER_LINEAR)
+            photo_change = float(np.mean(np.abs(cur_gray.astype(np.float32) - ref_gray.astype(np.float32))) / 255.0)
+
+        return depth_change, photo_change, overlap
+
+    @staticmethod
+    def _to_gray_u8(img):
+        if img is None:
+            return None
+        arr = np.asarray(img)
+        if arr.ndim == 2:
+            if arr.dtype == np.uint8:
+                return arr
+            return np.clip(arr, 0, 255).astype(np.uint8)
+        if arr.ndim == 3 and arr.shape[2] >= 3:
+            arr_u8 = arr if arr.dtype == np.uint8 else np.clip(arr, 0, 255).astype(np.uint8)
+            return cv2.cvtColor(arr_u8[..., :3], cv2.COLOR_BGR2GRAY)
+        return None
 
     def _preprocess_depth(self, depth_m: np.ndarray):
         d = np.asarray(depth_m, dtype=np.float32)

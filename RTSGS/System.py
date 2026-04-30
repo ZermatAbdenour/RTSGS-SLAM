@@ -39,6 +39,8 @@ class RTSGSSystem:
         self.gs = GaussianSplatting(self.pcd, self.dataset, self.tracker)
         if hasattr(self.tracker, "set_rendered_depth_provider"):
             self.tracker.set_rendered_depth_provider(self.gs.render_depth_at_pose)
+        if hasattr(self.tracker, "set_rendered_rgb_provider"):
+            self.tracker.set_rendered_rgb_provider(self.gs.render_rgb_at_pose)
         if hasattr(self.pcd, "set_rendered_depth_provider"):
             self.pcd.set_rendered_depth_provider(self.gs.render_depth_at_pose)
         self.window = WindowManager(
