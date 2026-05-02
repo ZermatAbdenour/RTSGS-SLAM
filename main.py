@@ -26,8 +26,8 @@ if __name__ == "__main__":
     #data = TUMDataLoader(os.path.join(data_path, "rgb"), os.path.join(data_path, "depth"),trajectory_path)
 
     # Replica
-    data_path = "./Datasets/Replica/ThirdParty/Replica/room1/results"
-    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/room1/traj.txt"
+    data_path = "./Datasets/Replica/ThirdParty/Replica/office3/results"
+    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/office3/traj.txt"
     data = ReplicaDataLoader(data_path=data_path,trajectory_path=trajectory_path)
 
     # ScanNet

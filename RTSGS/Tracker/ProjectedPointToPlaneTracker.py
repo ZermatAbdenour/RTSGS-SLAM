@@ -1,9 +1,5 @@
 from __future__ import annotations
 
-import csv
-import os
-from datetime import datetime
-
 import cv2
 import numpy as np
 import torch
@@ -35,17 +31,20 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.alpha = float(config.get("kf_translation", 0.05))
         self.theta = float(config.get("kf_rotation", 5.0 * np.pi / 180.0))
 
-        self.icp_stride = int(config.get("icp_stride", 2))
+        self.icp_stride = int(config.get("icp_stride", 4))
         self.icp_max_iters = int(config.get("icp_max_iters", 12))
-        self.icp_corr_dist = float(config.get("icp_corr_dist", 0.01))
+        self.icp_corr_dist = float(config.get("icp_corr_dist", 0.12))
+        self.icp_min_pairs = int(config.get("icp_min_pairs", 1200))
         self.icp_huber_delta = float(config.get("icp_huber_delta", 0.02))
         self.icp_damping = float(config.get("icp_damping", 1e-5))
+        self.icp_plane_residual_max = float(config.get("icp_plane_residual_max", 0.04))
         self.icp_use_projective = bool(config.get("icp_use_projective", True))
+        self.icp_proj_depth_max_diff = float(config.get("icp_proj_depth_max_diff", 0.08))
         self.depth_min = float(config.get("depth_min", 0.10))
         self.depth_max = float(config.get("depth_max", 8.0))
 
-        self.depth_median_ksize = int(config.get("depth_median_ksize", 1))
-        self.depth_bilateral_d = int(config.get("depth_bilateral_d", 1))
+        self.depth_median_ksize = int(config.get("depth_median_ksize", 5))
+        self.depth_bilateral_d = int(config.get("depth_bilateral_d", 5))
         self.depth_bilateral_sigma_color = float(config.get("depth_bilateral_sigma_color", 0.04))
         self.depth_bilateral_sigma_space = float(config.get("depth_bilateral_sigma_space", 2.0))
 
@@ -57,35 +56,13 @@ class ProjectedPointToPlaneTracker(Tracker):
 
         self.poses = [self._initial_pose_from_dataset(dataset)]
         self.last_kf_pose = None
-        self.keyframe_frame_indices = []
 
         self.prev_depth_m: np.ndarray | None = None
         self.prev_rgb: np.ndarray | None = None
         self.prev_rel_T = torch.eye(4, dtype=torch.float32, device=self.device)
         self.rendered_depth_provider = None
         self.use_rendered_depth_icp = bool(config.get("use_rendered_depth_icp", True))
-        self.rendered_rgb_provider = None
         self.last_ref_depth_source = "prev"
-        self.last_rendered_depth_m: np.ndarray | None = None
-        self.keyframes_rendered_depth_m = []
-
-        # Keyframe-to-keyframe gating based on rendered/reference disagreement.
-        self.kf_depth_change_threshold_m = float(config.get("kf_depth_change_threshold_m", 0.03))
-        self.kf_photometric_change_threshold = float(config.get("kf_photometric_change_threshold", 0.08))
-        self.kf_depth_min_coverage = float(config.get("kf_depth_min_coverage", 0.10))
-        self.kf_min_frame_gap = int(config.get("kf_min_frame_gap", 1))
-        self.kf_max_frame_gap = int(config.get("kf_max_frame_gap", 30))
-        self.kf_require_both_signals = bool(config.get("kf_require_both_signals", True))
-
-        self._frame_index = -1
-        self._last_keyframe_frame_index = -1
-        self.last_keyframe_depth_m: np.ndarray | None = None
-        self.last_keyframe_gray_u8: np.ndarray | None = None
-
-        self.last_depth_change_m = 0.0
-        self.last_photo_change = 0.0
-        self.last_depth_overlap = 0.0
-        self.last_change_decision = "init"
 
         self.viz_img = None
         self.img_window = None
@@ -96,15 +73,7 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.last_icp_iterations = 0
         self.last_icp_rmse = 0.0
 
-        self.metrics_run_name = ""
-        self.metrics_comment = ""
-        self.metrics_save_status = ""
-        project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
-        self.metrics_csv_path = os.path.join(project_root, "logs", "trajectory_metrics.csv")
-
     def track_frame(self, rgb, depth=None):
-        self._frame_index += 1
-
         if depth is None:
             self.prev_rgb = rgb
             return None
@@ -117,94 +86,63 @@ class ProjectedPointToPlaneTracker(Tracker):
             self.prev_rgb = rgb
             self.viz_img = self._make_tracking_debug_image(rgb, depth_m, depth_m, "init")
             init_pose = self.poses[0].astype(np.float32)
-            self.last_keyframe_depth_m = depth_m.copy()
-            self.last_keyframe_gray_u8 = self._to_gray_u8(rgb)
-            self._last_keyframe_frame_index = self._frame_index
-            self.last_depth_change_m = 0.0
-            self.last_photo_change = 0.0
-            self.last_depth_overlap = 1.0
-            self.last_change_decision = "seed"
             if self.dataset is not None:
                 self.dataset.rgb_keyframes.append(rgb)
                 self.dataset.depth_keyframes.append(depth)
                 self.keyframes_poses.append(init_pose)
-                self.keyframe_frame_indices.append(0)
-                self.keyframes_rendered_depth_m.append(None)
                 self.last_kf_pose = init_pose
                 self.dataset.current_keyframe_index += 1
             return None
 
-        # Build references from the last accepted keyframe pose.
-        ref_pose = self.keyframes_poses[-1] if len(self.keyframes_poses) > 0 else self.poses[-1]
-        ref_depth_m, depth_ref_source, ref_rgb = self._build_reference_views(depth_m, ref_pose)
-        self.last_ref_depth_source = depth_ref_source
-        self.last_rendered_depth_m = ref_depth_m
+        ref_depth_m = None
+        self.last_ref_depth_source = "prev"
 
-        depth_change_m, photo_change, overlap = self._compute_change_signals(
-            cur_depth_m=depth_m,
-            ref_depth_m=ref_depth_m,
-            cur_rgb=rgb,
-            ref_rgb=ref_rgb,
-        )
-        self.last_depth_change_m = float(depth_change_m)
-        self.last_photo_change = float(photo_change)
-        self.last_depth_overlap = float(overlap)
+        if self.use_rendered_depth_icp and self.rendered_depth_provider is not None and len(self.poses) > 0:
+            try:
+                rendered_depth = self.rendered_depth_provider(self.poses[-1])
+            except Exception:
+                rendered_depth = None
 
-        frames_since_kf = self._frame_index - self._last_keyframe_frame_index
-        depth_trigger = depth_change_m >= self.kf_depth_change_threshold_m
-        photo_trigger = photo_change >= self.kf_photometric_change_threshold
-        if self.kf_require_both_signals:
-            change_trigger = depth_trigger and photo_trigger
-        else:
-            change_trigger = depth_trigger or photo_trigger
+            if rendered_depth is not None:
+                rendered_depth = np.asarray(rendered_depth, dtype=np.float32)
+                if rendered_depth.shape == depth_m.shape:
+                    rendered_depth = self._preprocess_depth(rendered_depth)
+                    valid_rendered = np.count_nonzero(
+                        (rendered_depth > self.depth_min) & (rendered_depth < self.depth_max) & np.isfinite(rendered_depth)
+                    )
+                    if valid_rendered >= self.icp_min_pairs:
+                        ref_depth_m = rendered_depth
+                        self.last_ref_depth_source = "rendered"
 
-        should_add_keyframe = (
-            frames_since_kf >= self.kf_min_frame_gap
-            and (change_trigger or frames_since_kf >= self.kf_max_frame_gap)
-        )
+        if ref_depth_m is None:
+            ref_depth_m = self.prev_depth_m
 
-        if not should_add_keyframe:
-            self.last_change_decision = "skip"
-            # Keep dense trajectory history for plotting/metrics across all frames.
-            self.poses.append(self.poses[-1].copy())
-            self.prev_depth_m = depth_m
-            self.prev_rgb = rgb
-            self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
-            return None
-
-        # Keyframe-to-keyframe tracking: estimate only when the frame is promoted.
-        T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, torch.eye(4, dtype=torch.float32, device=self.device))
+        T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, self.prev_rel_T)
         self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
         if T_rel is None:
-            self.last_change_decision = "icp-fail"
-            self.poses.append(self.poses[-1].copy())
             self.prev_depth_m = depth_m
             self.prev_rgb = rgb
             return None
 
         T_rel_np = T_rel.detach().cpu().numpy().astype(np.float32)
-        pose = ref_pose @ np.linalg.inv(T_rel_np)
-        pose = pose.astype(np.float32)
+        pose = self.poses[-1] @ np.linalg.inv(T_rel_np)
+        self.poses.append(pose.astype(np.float32))
+        self.prev_rel_T = T_rel.detach()
 
-        self.poses.append(pose)
-        self.prev_rel_T = torch.eye(4, dtype=torch.float32, device=self.device)
+        is_keyframe = False
+        if self.last_kf_pose is None:
+            is_keyframe = True
+        else:
+            dt, dR = self._pose_distance(self.last_kf_pose, pose)
+            if dt > self.alpha or dR > self.theta:
+                is_keyframe = True
 
-        if self.dataset is not None:
+        if is_keyframe and self.dataset is not None:
             self.dataset.rgb_keyframes.append(rgb)
             self.dataset.depth_keyframes.append(depth)
-            self.keyframes_poses.append(pose)
-            self.keyframe_frame_indices.append(self._frame_index)
-            if self.last_rendered_depth_m is None:
-                self.keyframes_rendered_depth_m.append(None)
-            else:
-                self.keyframes_rendered_depth_m.append(self.last_rendered_depth_m.copy())
+            self.keyframes_poses.append(pose.astype(np.float32))
             self.last_kf_pose = pose
             self.dataset.current_keyframe_index += 1
-
-        self.last_keyframe_depth_m = depth_m.copy()
-        self.last_keyframe_gray_u8 = self._to_gray_u8(rgb)
-        self._last_keyframe_frame_index = self._frame_index
-        self.last_change_decision = "accept"
 
         self.prev_depth_m = depth_m
         self.prev_rgb = rgb
@@ -213,10 +151,6 @@ class ProjectedPointToPlaneTracker(Tracker):
     def set_rendered_depth_provider(self, provider):
         """Set callable provider: provider(pose_4x4_np) -> depth_m (H,W) or None."""
         self.rendered_depth_provider = provider
-
-    def set_rendered_rgb_provider(self, provider):
-        """Set callable provider: provider(pose_4x4_np) -> rgb uint8 (H,W,3) or None."""
-        self.rendered_rgb_provider = provider
 
     def visualize_tracking(self):
         if self.viz_img is None:
@@ -252,11 +186,6 @@ class ProjectedPointToPlaneTracker(Tracker):
         imgui.text(f"Last ICP iterations: {self.last_icp_iterations}")
         imgui.text(f"Last ICP RMSE: {self.last_icp_rmse:.5f} m")
         imgui.text(f"Ref depth source: {self.last_ref_depth_source}")
-        imgui.text(
-            f"KF gate: depth={self.last_depth_change_m:.4f} m, "
-            f"photo={self.last_photo_change:.4f}, overlap={self.last_depth_overlap:.3f}, "
-            f"decision={self.last_change_decision}"
-        )
 
         if self.dataset is not None and getattr(self.dataset, "time_stamps", None) is not None and self.dataset.time_stamps.shape[0] > 1:
             fps = self.dataset.time_stamps.shape[0] / (self.dataset.time_stamps[-1] - self.dataset.time_stamps[0])
@@ -315,50 +244,8 @@ class ProjectedPointToPlaneTracker(Tracker):
             imgui.end()
             return
 
-        pred_aligned, (s, _, _) = self._umeyama_align(pred, gt, with_scale=False)
+        pred_aligned, (s, _, _) = self._umeyama_align(pred, gt, with_scale=True)
         imgui.text(f"Alignment: scale={s:.4f}")
-
-        metrics = self._compute_traj_metrics(pred, gt, pred_aligned)
-        if metrics is not None:
-            imgui.separator()
-            imgui.text("SLAM trajectory metrics")
-            imgui.text(f"Samples used: {metrics['num_samples']}")
-            imgui.text(
-                f"ATE RMSE (aligned): {metrics['ate_aligned_rmse_m']:.4f} m | "
-                f"Raw: {metrics['ate_raw_rmse_m']:.4f} m"
-            )
-            imgui.text(
-                f"ATE mean/median/std/max (aligned): "
-                f"{metrics['ate_aligned_mean_m']:.4f} / {metrics['ate_aligned_median_m']:.4f} / "
-                f"{metrics['ate_aligned_std_m']:.4f} / {metrics['ate_aligned_max_m']:.4f} m"
-            )
-            imgui.text(
-                f"RPE trans RMSE/mean (aligned): "
-                f"{metrics['rpe_trans_rmse_m']:.4f} / {metrics['rpe_trans_mean_m']:.4f} m"
-            )
-            imgui.text(
-                f"RPE rot RMSE/mean (aligned): "
-                f"{metrics['rpe_rot_rmse_deg']:.3f} / {metrics['rpe_rot_mean_deg']:.3f} deg"
-            )
-            imgui.text(
-                f"Path length pred/gt (aligned): "
-                f"{metrics['pred_path_len_m']:.3f} / {metrics['gt_path_len_m']:.3f} m "
-                f"(ratio={metrics['path_len_ratio']:.3f})"
-            )
-
-            imgui.separator()
-            _, self.metrics_run_name = imgui.input_text("Run name", self.metrics_run_name, 128)
-            _, self.metrics_comment = imgui.input_text("Comment", self.metrics_comment, 256)
-
-            if imgui.button("Save Metrics CSV"):
-                ok, msg = self._save_metrics_to_csv(metrics, float(s))
-                self.metrics_save_status = msg
-
-            if self.metrics_save_status:
-                if self.metrics_save_status.startswith("Saved"):
-                    imgui.text_colored((0.4, 0.9, 0.4, 1.0), self.metrics_save_status)
-                else:
-                    imgui.text_colored((1.0, 0.5, 0.5, 1.0), self.metrics_save_status)
 
         px = np.ascontiguousarray(pred_aligned[:, 0], dtype=np.float32)
         py = np.ascontiguousarray(pred_aligned[:, 1], dtype=np.float32)
@@ -400,8 +287,14 @@ class ProjectedPointToPlaneTracker(Tracker):
         src = self._depth_to_points(prev_depth_m, self.icp_stride)
         tgt_pts, tgt_nrm = self._depth_to_points_normals(cur_depth_m, self.icp_stride)
 
+        self.last_icp_pairs = 0
+        self.last_icp_iterations = 0
+        self.last_icp_rmse = 0.0
+
         if src is None or tgt_pts is None or tgt_nrm is None:
-            return T_init.clone()
+            return None
+        if src.shape[0] < self.icp_min_pairs or tgt_pts.shape[0] < self.icp_min_pairs:
+            return None
 
         T = T_init.clone()
 
@@ -417,16 +310,22 @@ class ProjectedPointToPlaneTracker(Tracker):
 
             mask = d2 < (self.icp_corr_dist * self.icp_corr_dist)
             num_pairs = torch.count_nonzero(mask).item()
-            if num_pairs <= 0:
-                break
+            if num_pairs < self.icp_min_pairs:
+                return None
 
             p = src_t[mask]
             q = tgt_corr[mask]
             n = nrm_corr[mask]
 
             r = torch.sum(n * (p - q), dim=1)
-            if r.numel() == 0:
-                break
+            if self.icp_plane_residual_max > 0.0:
+                residual_mask = torch.abs(r) < self.icp_plane_residual_max
+                if torch.count_nonzero(residual_mask).item() < self.icp_min_pairs:
+                    return None
+                p = p[residual_mask]
+                q = q[residual_mask]
+                n = n[residual_mask]
+                r = r[residual_mask]
 
             w = self._huber_weight(r, self.icp_huber_delta)
 
@@ -445,10 +344,10 @@ class ProjectedPointToPlaneTracker(Tracker):
             try:
                 xi = torch.linalg.solve(H, g)
             except RuntimeError:
-                break
+                return None
 
             if not torch.isfinite(xi).all():
-                break
+                return None
 
             dT = self._se3_exp(xi)
             T = dT @ T
@@ -464,6 +363,10 @@ class ProjectedPointToPlaneTracker(Tracker):
 
         h, w = prev_d.shape
 
+        self.last_icp_pairs = 0
+        self.last_icp_iterations = 0
+        self.last_icp_rmse = 0.0
+
         # Build source sample from previous depth (subsampled grid).
         v = torch.arange(1, h - 1, self.icp_stride, device=self.device)
         u = torch.arange(1, w - 1, self.icp_stride, device=self.device)
@@ -471,8 +374,8 @@ class ProjectedPointToPlaneTracker(Tracker):
 
         z = prev_d[vv, uu]
         valid = (z > self.depth_min) & (z < self.depth_max) & torch.isfinite(z)
-        if torch.count_nonzero(valid).item() <= 0:
-            return T_init.clone()
+        if torch.count_nonzero(valid).item() < self.icp_min_pairs:
+            return None
 
         uu = uu[valid].float()
         vv = vv[valid].float()
@@ -500,8 +403,8 @@ class ProjectedPointToPlaneTracker(Tracker):
 
             in_bounds = (ui >= 1) & (ui < (w - 1)) & (vi >= 1) & (vi < (h - 1))
             mask = valid_z & in_bounds
-            if torch.count_nonzero(mask).item() <= 0:
-                break
+            if torch.count_nonzero(mask).item() < self.icp_min_pairs:
+                return None
 
             p = p[mask]
             ui = ui[mask]
@@ -510,16 +413,31 @@ class ProjectedPointToPlaneTracker(Tracker):
             q = vmap[vi, ui]
             n = nmap[vi, ui]
             vm = valid_map[vi, ui]
-            if torch.count_nonzero(vm).item() <= 0:
-                break
+            if torch.count_nonzero(vm).item() < self.icp_min_pairs:
+                return None
 
             p = p[vm]
             q = q[vm]
             n = n[vm]
 
+            # Reject pairs with large depth disagreement (projective outlier gate).
+            if self.icp_proj_depth_max_diff > 0.0:
+                dz_mask = torch.abs(p[:, 2] - q[:, 2]) < self.icp_proj_depth_max_diff
+                if torch.count_nonzero(dz_mask).item() < self.icp_min_pairs:
+                    return None
+                p = p[dz_mask]
+                q = q[dz_mask]
+                n = n[dz_mask]
+
             r = torch.sum(n * (p - q), dim=1)
-            if r.numel() == 0:
-                break
+            if self.icp_plane_residual_max > 0.0:
+                residual_mask = torch.abs(r) < self.icp_plane_residual_max
+                if torch.count_nonzero(residual_mask).item() < self.icp_min_pairs:
+                    return None
+                p = p[residual_mask]
+                q = q[residual_mask]
+                n = n[residual_mask]
+                r = r[residual_mask]
 
             num_pairs = p.shape[0]
             self.last_icp_pairs = int(num_pairs)
@@ -539,10 +457,10 @@ class ProjectedPointToPlaneTracker(Tracker):
             try:
                 xi = torch.linalg.solve(H, g)
             except RuntimeError:
-                break
+                return None
 
             if not torch.isfinite(xi).all():
-                break
+                return None
 
             dT = self._se3_exp(xi)
             T = dT @ T
@@ -824,157 +742,6 @@ class ProjectedPointToPlaneTracker(Tracker):
         aligned = (scale * (R @ src.T)).T + t
         return aligned.astype(np.float32), (float(scale), R.astype(np.float32), t.astype(np.float32))
 
-    @staticmethod
-    def _safe_stats(x: np.ndarray):
-        if x is None or x.size == 0:
-            return 0.0, 0.0, 0.0, 0.0, 0.0
-        x = np.asarray(x, dtype=np.float64)
-        rmse = float(np.sqrt(np.mean(x * x)))
-        mean = float(np.mean(x))
-        median = float(np.median(x))
-        std = float(np.std(x))
-        mx = float(np.max(x))
-        return rmse, mean, median, std, mx
-
-    @staticmethod
-    def _rotation_angle_deg(R: np.ndarray) -> float:
-        tr = float(np.trace(R))
-        c = np.clip((tr - 1.0) * 0.5, -1.0, 1.0)
-        return float(np.degrees(np.arccos(c)))
-
-    @staticmethod
-    def _compute_path_length(xyz: np.ndarray) -> float:
-        if xyz is None or xyz.shape[0] < 2:
-            return 0.0
-        d = xyz[1:] - xyz[:-1]
-        return float(np.linalg.norm(d, axis=1).sum())
-
-    def _compute_traj_metrics(self, pred_xyz: np.ndarray, gt_xyz: np.ndarray, pred_xyz_aligned: np.ndarray):
-        if pred_xyz is None or gt_xyz is None or pred_xyz_aligned is None:
-            return None
-        if pred_xyz.shape[0] < 3 or gt_xyz.shape[0] < 3 or pred_xyz_aligned.shape[0] < 3:
-            return None
-
-        e_raw = np.linalg.norm(pred_xyz - gt_xyz, axis=1)
-        e_aligned = np.linalg.norm(pred_xyz_aligned - gt_xyz, axis=1)
-        ate_raw_rmse, _, _, _, _ = self._safe_stats(e_raw)
-        ate_aligned_rmse, ate_aligned_mean, ate_aligned_median, ate_aligned_std, ate_aligned_max = self._safe_stats(e_aligned)
-
-        # Relative Pose Error (RPE) on position and heading change from successive frames.
-        d_pred = pred_xyz_aligned[1:] - pred_xyz_aligned[:-1]
-        d_gt = gt_xyz[1:] - gt_xyz[:-1]
-        rpe_trans = np.linalg.norm(d_pred - d_gt, axis=1)
-        rpe_trans_rmse, rpe_trans_mean, _, _, _ = self._safe_stats(rpe_trans)
-
-        # Rotation RPE from full poses when available, using frame-wise relative transforms.
-        rpe_rot_deg = np.array([], dtype=np.float64)
-        if self.dataset is not None and getattr(self.dataset, "gt_poses", None) is not None and len(self.poses) >= 3:
-            n = min(len(self.poses), len(self.dataset.gt_poses))
-            pred_pose = np.asarray(self.poses[:n], dtype=np.float64)
-            gt_pose = np.asarray(self.dataset.gt_poses[:n], dtype=np.float64)
-
-            valid = np.isfinite(pred_pose).all(axis=(1, 2)) & np.isfinite(gt_pose).all(axis=(1, 2))
-            pred_pose = pred_pose[valid]
-            gt_pose = gt_pose[valid]
-
-            if pred_pose.shape[0] >= 3:
-                pred_pos = pred_pose[:, :3, 3]
-                gt_pos = gt_pose[:, :3, 3]
-                _, (s, R_align, t_align) = self._umeyama_align(pred_pos, gt_pos, with_scale=False)
-
-                pred_pose_aligned = pred_pose.copy()
-                pred_pose_aligned[:, :3, :3] = R_align[None, :, :] @ pred_pose[:, :3, :3]
-                pred_pose_aligned[:, :3, 3] = (R_align @ pred_pos.T).T + t_align[None, :]
-
-                rot_err = []
-                for i in range(1, pred_pose_aligned.shape[0]):
-                    dP = np.linalg.inv(pred_pose_aligned[i - 1]) @ pred_pose_aligned[i]
-                    dG = np.linalg.inv(gt_pose[i - 1]) @ gt_pose[i]
-                    E = np.linalg.inv(dG) @ dP
-                    rot_err.append(self._rotation_angle_deg(E[:3, :3]))
-                if rot_err:
-                    rpe_rot_deg = np.asarray(rot_err, dtype=np.float64)
-
-        rpe_rot_rmse, rpe_rot_mean, _, _, _ = self._safe_stats(rpe_rot_deg)
-
-        pred_len = self._compute_path_length(pred_xyz_aligned)
-        gt_len = self._compute_path_length(gt_xyz)
-        ratio = float(pred_len / gt_len) if gt_len > 1e-12 else 0.0
-
-        return {
-            "num_samples": int(pred_xyz.shape[0]),
-            "ate_raw_rmse_m": float(ate_raw_rmse),
-            "ate_aligned_rmse_m": float(ate_aligned_rmse),
-            "ate_aligned_mean_m": float(ate_aligned_mean),
-            "ate_aligned_median_m": float(ate_aligned_median),
-            "ate_aligned_std_m": float(ate_aligned_std),
-            "ate_aligned_max_m": float(ate_aligned_max),
-            "rpe_trans_rmse_m": float(rpe_trans_rmse),
-            "rpe_trans_mean_m": float(rpe_trans_mean),
-            "rpe_rot_rmse_deg": float(rpe_rot_rmse),
-            "rpe_rot_mean_deg": float(rpe_rot_mean),
-            "pred_path_len_m": float(pred_len),
-            "gt_path_len_m": float(gt_len),
-            "path_len_ratio": float(ratio),
-        }
-
-    def _save_metrics_to_csv(self, metrics: dict, align_scale: float):
-        try:
-            os.makedirs(os.path.dirname(self.metrics_csv_path), exist_ok=True)
-
-            headers = [
-                "timestamp",
-                "run_name",
-                "comment",
-                "alignment_scale",
-                "num_samples",
-                "ate_raw_rmse_m",
-                "ate_aligned_rmse_m",
-                "ate_aligned_mean_m",
-                "ate_aligned_median_m",
-                "ate_aligned_std_m",
-                "ate_aligned_max_m",
-                "rpe_trans_rmse_m",
-                "rpe_trans_mean_m",
-                "rpe_rot_rmse_deg",
-                "rpe_rot_mean_deg",
-                "pred_path_len_m",
-                "gt_path_len_m",
-                "path_len_ratio",
-            ]
-
-            row = {
-                "timestamp": datetime.now().isoformat(timespec="seconds"),
-                "run_name": self.metrics_run_name.strip(),
-                "comment": self.metrics_comment.strip(),
-                "alignment_scale": float(align_scale),
-                "num_samples": int(metrics.get("num_samples", 0)),
-                "ate_raw_rmse_m": float(metrics.get("ate_raw_rmse_m", 0.0)),
-                "ate_aligned_rmse_m": float(metrics.get("ate_aligned_rmse_m", 0.0)),
-                "ate_aligned_mean_m": float(metrics.get("ate_aligned_mean_m", 0.0)),
-                "ate_aligned_median_m": float(metrics.get("ate_aligned_median_m", 0.0)),
-                "ate_aligned_std_m": float(metrics.get("ate_aligned_std_m", 0.0)),
-                "ate_aligned_max_m": float(metrics.get("ate_aligned_max_m", 0.0)),
-                "rpe_trans_rmse_m": float(metrics.get("rpe_trans_rmse_m", 0.0)),
-                "rpe_trans_mean_m": float(metrics.get("rpe_trans_mean_m", 0.0)),
-                "rpe_rot_rmse_deg": float(metrics.get("rpe_rot_rmse_deg", 0.0)),
-                "rpe_rot_mean_deg": float(metrics.get("rpe_rot_mean_deg", 0.0)),
-                "pred_path_len_m": float(metrics.get("pred_path_len_m", 0.0)),
-                "gt_path_len_m": float(metrics.get("gt_path_len_m", 0.0)),
-                "path_len_ratio": float(metrics.get("path_len_ratio", 0.0)),
-            }
-
-            write_header = (not os.path.exists(self.metrics_csv_path)) or (os.path.getsize(self.metrics_csv_path) == 0)
-            with open(self.metrics_csv_path, "a", newline="", encoding="utf-8") as f:
-                writer = csv.DictWriter(f, fieldnames=headers)
-                if write_header:
-                    writer.writeheader()
-                writer.writerow(row)
-
-            return True, f"Saved metrics to {self.metrics_csv_path}"
-        except Exception as e:
-            return False, f"Failed to save metrics: {e}"
-
     def _make_tracking_debug_image(self, rgb, ref_depth_m, cur_depth_m, ref_label="ref"):
         if rgb is None:
             return None
@@ -1017,88 +784,6 @@ class ProjectedPointToPlaneTracker(Tracker):
             img[~valid] = 0
 
         return cv2.applyColorMap(img, cv2.COLORMAP_TURBO)
-
-    def _build_reference_views(self, cur_depth_m: np.ndarray, ref_pose: np.ndarray):
-        ref_depth_m = None
-        ref_rgb = None
-        depth_source = "keyframe"
-
-        if self.rendered_depth_provider is not None:
-            try:
-                rendered_depth = self.rendered_depth_provider(ref_pose)
-            except Exception:
-                rendered_depth = None
-            if rendered_depth is not None:
-                ref_depth_m = np.asarray(rendered_depth, dtype=np.float32)
-                if ref_depth_m.shape != cur_depth_m.shape:
-                    ref_depth_m = cv2.resize(
-                        ref_depth_m,
-                        (cur_depth_m.shape[1], cur_depth_m.shape[0]),
-                        interpolation=cv2.INTER_NEAREST,
-                    )
-                ref_depth_m = self._preprocess_depth(ref_depth_m)
-                depth_source = "rendered"
-
-        if ref_depth_m is None:
-            if self.last_keyframe_depth_m is not None:
-                ref_depth_m = self.last_keyframe_depth_m.copy()
-            else:
-                ref_depth_m = np.zeros_like(cur_depth_m, dtype=np.float32)
-
-        if self.rendered_rgb_provider is not None:
-            try:
-                rendered_rgb = self.rendered_rgb_provider(ref_pose)
-            except Exception:
-                rendered_rgb = None
-            if rendered_rgb is not None:
-                ref_rgb = np.asarray(rendered_rgb)
-
-        if ref_rgb is None and self.last_keyframe_gray_u8 is not None:
-            ref_rgb = self.last_keyframe_gray_u8
-
-        return ref_depth_m, depth_source, ref_rgb
-
-    def _compute_change_signals(self, cur_depth_m: np.ndarray, ref_depth_m: np.ndarray, cur_rgb, ref_rgb):
-        cur_d = np.asarray(cur_depth_m, dtype=np.float32)
-        ref_d = np.asarray(ref_depth_m, dtype=np.float32)
-
-        if ref_d.shape != cur_d.shape:
-            ref_d = cv2.resize(ref_d, (cur_d.shape[1], cur_d.shape[0]), interpolation=cv2.INTER_NEAREST)
-
-        valid_cur = np.isfinite(cur_d) & (cur_d > self.depth_min) & (cur_d < self.depth_max)
-        valid_ref = np.isfinite(ref_d) & (ref_d > self.depth_min) & (ref_d < self.depth_max)
-        valid = valid_cur & valid_ref
-        overlap = float(np.mean(valid))
-
-        if overlap >= self.kf_depth_min_coverage and np.any(valid):
-            depth_change = float(np.mean(np.abs(cur_d[valid] - ref_d[valid])))
-        else:
-            depth_change = float("inf")
-
-        cur_gray = self._to_gray_u8(cur_rgb)
-        ref_gray = self._to_gray_u8(ref_rgb)
-        if ref_gray is None:
-            photo_change = 1.0
-        else:
-            if ref_gray.shape != cur_gray.shape:
-                ref_gray = cv2.resize(ref_gray, (cur_gray.shape[1], cur_gray.shape[0]), interpolation=cv2.INTER_LINEAR)
-            photo_change = float(np.mean(np.abs(cur_gray.astype(np.float32) - ref_gray.astype(np.float32))) / 255.0)
-
-        return depth_change, photo_change, overlap
-
-    @staticmethod
-    def _to_gray_u8(img):
-        if img is None:
-            return None
-        arr = np.asarray(img)
-        if arr.ndim == 2:
-            if arr.dtype == np.uint8:
-                return arr
-            return np.clip(arr, 0, 255).astype(np.uint8)
-        if arr.ndim == 3 and arr.shape[2] >= 3:
-            arr_u8 = arr if arr.dtype == np.uint8 else np.clip(arr, 0, 255).astype(np.uint8)
-            return cv2.cvtColor(arr_u8[..., :3], cv2.COLOR_BGR2GRAY)
-        return None
 
     def _preprocess_depth(self, depth_m: np.ndarray):
         d = np.asarray(depth_m, dtype=np.float32)
