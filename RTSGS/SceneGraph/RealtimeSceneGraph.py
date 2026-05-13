@@ -51,6 +51,7 @@ class RealtimeSceneGraphRuntime:
 
         self.max_objects_per_keyframe = int(config.get("scenegraph_max_objects_per_keyframe", 12))
         self.update_stride = max(1, int(config.get("scenegraph_update_stride", 1)))
+        self._last_published_kf = -1
         self.max_nodes = int(config.get("scenegraph_max_nodes", 48))
         # Keep all relations above the fixed threshold (RelationHead only, no MP-GNN).
         self.max_relations = int(config.get("scenegraph_max_relations", 0))
@@ -82,6 +83,9 @@ class RealtimeSceneGraphRuntime:
 
         self._ready = False
         self._last_error = ""
+
+        # Optional benchmark collector (set by System when benchmark=True)
+        self.benchmark = None
 
     def _abs_path(self, p: str) -> str:
         if os.path.isabs(p):
@@ -185,27 +189,10 @@ class RealtimeSceneGraphRuntime:
                     if key[0] not in stale_set and key[1] not in stale_set
                 }
 
-    def _merge_instance_id(self, inst_id: int, class_id: int, center: torch.Tensor) -> int:
-        if inst_id in self.instance_state:
-            return inst_id
-        if self.instance_merge_dist <= 0.0:
-            return inst_id
-
-        best_id = inst_id
-        best_dist = float("inf")
-        for iid, st in self.instance_state.items():
-            if int(st.get("class_id", -1)) != int(class_id):
-                continue
-            prev_center = st.get("center", None)
-            if not isinstance(prev_center, torch.Tensor):
-                continue
-            dist = float(torch.linalg.norm(center - prev_center).item())
-            if dist < best_dist:
-                best_dist = dist
-                best_id = int(iid)
-
-        if best_dist <= float(self.instance_merge_dist):
-            return int(best_id)
+    def _merge_instance_id(self, inst_id: int, _class_id: int, _center: torch.Tensor) -> int:
+        # IDs are already persistent (PointCloud._update_instances_from_predictions does
+        # 3D Gaussian-overlap + bbox-IoU association across frames). Trust them — re-merging
+        # here on class+center would re-collapse distinct objects of the same class.
         return int(inst_id)
 
     def update_from_segmenter(self, seg_result: Optional[dict], kf_index: int):
@@ -213,7 +200,10 @@ class RealtimeSceneGraphRuntime:
             return
         if seg_result is None:
             return
-        publish_state = (int(kf_index) % self.update_stride) == 0
+        kf_i = int(kf_index)
+        publish_state = (self.update_stride <= 1) or (
+            self._last_published_kf < 0 or (kf_i - int(self._last_published_kf)) >= int(self.update_stride)
+        )
 
         observations = seg_result.get("scenegraph_observations", [])
         if not isinstance(observations, list):
@@ -221,7 +211,7 @@ class RealtimeSceneGraphRuntime:
 
         t0 = time.perf_counter()
 
-        self._prune_stale_instances(int(kf_index))
+        self._prune_stale_instances(kf_i)
 
         # Ensure every current segmentation instance exists in the scene-graph state.
         # This keeps old objects alive even when they are not in the per-frame observations.
@@ -250,7 +240,7 @@ class RealtimeSceneGraphRuntime:
                 st["size"] = size
                 st["class_id"] = int(inst.get("class_id", -1))
                 st["confidence"] = float(inst.get("score", st.get("confidence", 0.0)))
-                st["last_seen_kf"] = int(kf_index)
+                st["last_seen_kf"] = kf_i
             else:
                 if self._hidden_dim is None:
                     continue
@@ -261,7 +251,7 @@ class RealtimeSceneGraphRuntime:
                     "size": size,
                     "class_id": int(inst.get("class_id", -1)),
                     "confidence": float(inst.get("score", 0.0)),
-                    "last_seen_kf": int(kf_index),
+                    "last_seen_kf": kf_i,
                 }
 
         observations = sorted(
@@ -343,7 +333,7 @@ class RealtimeSceneGraphRuntime:
                     st["size"] = size
                     st["class_id"] = int(obs.get("class_id", -1))
                     st["confidence"] = float(obs.get("confidence", 0.0))
-                    st["last_seen_kf"] = int(kf_index)
+                    st["last_seen_kf"] = kf_i
                 else:
                     self.instance_state[inst_id] = {
                         "node_sum": feat_t.clone(),
@@ -352,7 +342,7 @@ class RealtimeSceneGraphRuntime:
                         "size": size,
                         "class_id": int(obs.get("class_id", -1)),
                         "confidence": float(obs.get("confidence", 0.0)),
-                        "last_seen_kf": int(kf_index),
+                        "last_seen_kf": kf_i,
                     }
 
                 frame_feats.append(feat_t)
@@ -361,7 +351,34 @@ class RealtimeSceneGraphRuntime:
 
             if len(frame_feats) >= 2:
                 obj_feats = torch.stack(frame_feats, dim=0).unsqueeze(0)
-                frame_logits = self._relation_head(obj_feats)[0]
+                bench = getattr(self, "benchmark", None)
+                do_bench = bool(getattr(bench, "enabled", False))
+                if do_bench:
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    t_fwd0 = time.perf_counter()
+                    frame_logits = self._relation_head(obj_feats)[0]
+                    try:
+                        if torch.cuda.is_available():
+                            torch.cuda.synchronize()
+                    except Exception:
+                        pass
+                    rel_ms = (time.perf_counter() - t_fwd0) * 1000.0
+                    try:
+                        from RTSGS.Benchmarking.BenchmarkCollector import BenchmarkCollector
+
+                        try:
+                            bench.observe_total_peak()
+                        except Exception:
+                            pass
+                        bench.record_ms(BenchmarkCollector.STAGE_RELATION_FWD, float(rel_ms))
+                    except Exception:
+                        pass
+                else:
+                    frame_logits = self._relation_head(obj_feats)[0]
                 frame_probs = torch.sigmoid(frame_logits)
                 k = int(frame_probs.shape[0])
                 debug["frame_pairs"] = int(k * (k - 1))
@@ -388,10 +405,10 @@ class RealtimeSceneGraphRuntime:
                                 self.relation_cache[key] = {
                                     "score": score,
                                     "predicate": rel_name,
-                                    "last_seen_kf": int(kf_index),
+                                    "last_seen_kf": kf_i,
                                 }
                             else:
-                                entry["last_seen_kf"] = int(kf_index)
+                                entry["last_seen_kf"] = kf_i
 
                             debug["relations_raw"] += 1
                             if score > debug["max_relation_score"]:
@@ -401,6 +418,8 @@ class RealtimeSceneGraphRuntime:
 
             if not publish_state:
                 return
+
+            self._last_published_kf = kf_i
 
             # Keep all historical instances in the scene graph.
             active = sorted(
@@ -468,7 +487,7 @@ class RealtimeSceneGraphRuntime:
             debug["relations_kept"] = int(len(relations))
 
             self._publish_state(
-                int(kf_index),
+                kf_i,
                 nodes,
                 relations,
                 scenegraph_ms=(time.perf_counter() - t0) * 1000.0,

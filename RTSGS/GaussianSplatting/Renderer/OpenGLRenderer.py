@@ -256,21 +256,46 @@ class Renderer:
             T_corr[:3, 3] = R_fix @ T[:3, 3]
             return T_corr
 
-        pred_poses = [_correct_pose(T) for T in list(getattr(self.tracker, "keyframes_poses", []))]
+        # Pose overlays (frustums + trajectory) are drawn for keyframes only.
+        # Prefer keyframe frame indices so we can reliably subset the full pose
+        # history (and align GT poses at the same frames).
+        kf_frame_indices = list(getattr(self.tracker, "keyframe_frame_indices", []))
+        poses_all = list(getattr(self.tracker, "poses", []) or [])
 
-        gt_poses = []
+        pred_kf_poses = []
+        if kf_frame_indices and poses_all:
+            for idx in kf_frame_indices:
+                try:
+                    i = int(idx)
+                except Exception:
+                    continue
+                if 0 <= i < len(poses_all):
+                    pred_kf_poses.append(_correct_pose(poses_all[i]))
+        else:
+            pred_kf_poses = [_correct_pose(T) for T in list(getattr(self.tracker, "keyframes_poses", []))]
+
+        pred_cam_poses = pred_kf_poses
+        pred_traj_poses = pred_kf_poses
+
+        gt_cam_poses = []
+        gt_traj_poses = []
         gt_poses_all = getattr(self.dataset, "gt_poses", None) if self.dataset is not None else None
         if gt_poses_all is not None:
             gt_poses_all = np.asarray(gt_poses_all)
-            kf_frame_indices = list(getattr(self.tracker, "keyframe_frame_indices", []))
             if kf_frame_indices:
                 for idx in kf_frame_indices:
-                    i = int(idx)
+                    try:
+                        i = int(idx)
+                    except Exception:
+                        continue
                     if 0 <= i < gt_poses_all.shape[0]:
-                        gt_poses.append(_correct_pose(gt_poses_all[i]))
+                        gt_pose = _correct_pose(gt_poses_all[i])
+                        gt_cam_poses.append(gt_pose)
+                        gt_traj_poses.append(gt_pose)
             else:
-                n = min(len(pred_poses), gt_poses_all.shape[0])
-                gt_poses = [_correct_pose(gt_poses_all[i]) for i in range(n)]
+                n_cam = min(len(pred_cam_poses), gt_poses_all.shape[0])
+                gt_cam_poses = [_correct_pose(gt_poses_all[i]) for i in range(n_cam)]
+                gt_traj_poses = list(gt_cam_poses)
 
         def _safe_normalize(v):
             n = float(np.linalg.norm(v))
@@ -304,8 +329,8 @@ class Renderer:
                 return np.empty((0, 15), dtype=np.float32)
             return np.asarray(rows, dtype=np.float32)
 
-        pred_cam_points = _build_camera_points(pred_poses, (1.0, 0.0, 0.0))
-        gt_cam_points = _build_camera_points(gt_poses, (0.0, 1.0, 0.0))
+        pred_cam_points = _build_camera_points(pred_cam_poses, (1.0, 0.0, 0.0))
+        gt_cam_points = _build_camera_points(gt_cam_poses, (0.0, 1.0, 0.0))
         if pred_cam_points.size == 0:
             camera_points = gt_cam_points
         elif gt_cam_points.size == 0:
@@ -313,8 +338,8 @@ class Renderer:
         else:
             camera_points = np.vstack([pred_cam_points, gt_cam_points]).astype(np.float32, copy=False)
 
-        pred_traj = self.pose_wireframe_builder.build_trajectory_vertices(pred_poses, (1.0, 0.0, 0.0))
-        gt_traj = self.pose_wireframe_builder.build_trajectory_vertices(gt_poses, (0.0, 1.0, 0.0))
+        pred_traj = self.pose_wireframe_builder.build_trajectory_vertices(pred_traj_poses, (1.0, 0.0, 0.0))
+        gt_traj = self.pose_wireframe_builder.build_trajectory_vertices(gt_traj_poses, (0.0, 1.0, 0.0))
         return camera_points, pred_traj, gt_traj
 
     def _update_pose_camera_vbo(self, camera_points: np.ndarray):
@@ -360,17 +385,38 @@ class Renderer:
         glBindBuffer(GL_ARRAY_BUFFER, 0)
 
     def _maybe_refresh_pose_overlay(self):
-        pred_count = len(getattr(self.tracker, "keyframes_poses", [])) if self.tracker is not None else 0
+        pred_kf_count = 0
+        if self.tracker is not None:
+            pred_kf_count = max(
+                len(getattr(self.tracker, "keyframes_poses", []) or []),
+                len(getattr(self.tracker, "keyframe_frame_indices", []) or []),
+            )
+        pred_traj_count = pred_kf_count
         gt_count = 0
         if self.dataset is not None and getattr(self.dataset, "gt_poses", None) is not None:
             gt_count = int(np.asarray(self.dataset.gt_poses).shape[0])
         kf_idx_count = len(getattr(self.tracker, "keyframe_frame_indices", [])) if self.tracker is not None else 0
         last_pred_t = None
-        if pred_count > 0:
-            lp = np.asarray(getattr(self.tracker, "keyframes_poses", [])[-1], dtype=np.float32)
+        if self.tracker is not None and pred_kf_count > 0:
+            if kf_idx_count > 0 and getattr(self.tracker, "poses", None):
+                poses_all = list(getattr(self.tracker, "poses", []) or [])
+                kf_indices = list(getattr(self.tracker, "keyframe_frame_indices", []))
+                if poses_all and kf_indices:
+                    try:
+                        i = int(kf_indices[-1])
+                    except Exception:
+                        i = None
+                    if i is not None and 0 <= i < len(poses_all):
+                        lp = np.asarray(poses_all[i], dtype=np.float32)
+                    else:
+                        lp = np.asarray(list(getattr(self.tracker, "keyframes_poses", []))[-1], dtype=np.float32)
+                else:
+                    lp = np.asarray(list(getattr(self.tracker, "keyframes_poses", []))[-1], dtype=np.float32)
+            else:
+                lp = np.asarray(list(getattr(self.tracker, "keyframes_poses", []))[-1], dtype=np.float32)
             if lp.shape == (4, 4):
                 last_pred_t = tuple(lp[:3, 3].tolist())
-        sig = (pred_count, gt_count, kf_idx_count, last_pred_t)
+        sig = (pred_kf_count, pred_traj_count, gt_count, kf_idx_count, last_pred_t)
 
         if (not self._pose_dirty) and (self._pose_cache_sig == sig):
             return

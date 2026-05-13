@@ -71,10 +71,13 @@ class Config:
             self.config_dict.setdefault("instance_bbox_expand_ratio", 0.2)
             self.config_dict.setdefault("instance_merge_min_ratio", 0.2)
 
+            # Semantic segmentation stride (run Mask2Former every N keyframes).
+            self.config_dict.setdefault("semantic_update_stride", 10)
+
             # Real-time scene graph: Mask2Former -> RelationHead -> global MP-GNN.
             self.config_dict.setdefault("scenegraph_enabled", True)
             self.config_dict.setdefault("scenegraph_max_objects_per_keyframe", 0)
-            self.config_dict.setdefault("scenegraph_update_stride", 1)
+            self.config_dict.setdefault("scenegraph_update_stride", 10)
             self.config_dict.setdefault("scenegraph_max_nodes", 48)
             self.config_dict.setdefault("scenegraph_max_relations", 256)
             self.config_dict.setdefault("scenegraph_rel_threshold", 0.5)

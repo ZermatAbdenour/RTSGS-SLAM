@@ -73,6 +73,9 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.last_icp_iterations = 0
         self.last_icp_rmse = 0.0
 
+        self._icp_fail_streak = 0
+        self._icp_fail_print_every = 60
+
     def track_frame(self, rgb, depth=None):
         if depth is None:
             self.prev_rgb = rgb
@@ -90,6 +93,7 @@ class ProjectedPointToPlaneTracker(Tracker):
                 self.dataset.rgb_keyframes.append(rgb)
                 self.dataset.depth_keyframes.append(depth)
                 self.keyframes_poses.append(init_pose)
+                self.keyframe_frame_indices.append(0)
                 self.last_kf_pose = init_pose
                 self.dataset.current_keyframe_index += 1
             return None
@@ -120,6 +124,27 @@ class ProjectedPointToPlaneTracker(Tracker):
         T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, self.prev_rel_T)
         self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
         if T_rel is None:
+            self._icp_fail_streak += 1
+            if (self._icp_fail_streak % self._icp_fail_print_every) == 0:
+                valid_prev = int(np.count_nonzero((ref_depth_m > self.depth_min) & (ref_depth_m < self.depth_max) & np.isfinite(ref_depth_m)))
+                valid_cur = int(np.count_nonzero((depth_m > self.depth_min) & (depth_m < self.depth_max) & np.isfinite(depth_m)))
+                # Show raw depth stats (before scaling) to catch wrong depth_scale.
+                d_raw = np.asarray(depth, dtype=np.float32) if depth is not None else None
+                if d_raw is not None:
+                    raw_min = float(np.nanmin(d_raw)) if d_raw.size else float("nan")
+                    raw_max = float(np.nanmax(d_raw)) if d_raw.size else float("nan")
+                    raw_dtype = str(depth.dtype)
+                else:
+                    raw_min = raw_max = float("nan")
+                    raw_dtype = "None"
+
+                print(
+                    "[Tracker] ICP failed repeatedly; check depth scale/range. "
+                    f"fail_streak={self._icp_fail_streak} src={self.last_ref_depth_source} "
+                    f"valid_prev={valid_prev} valid_cur={valid_cur} "
+                    f"depth_scale={self.depth_scale} raw_dtype={raw_dtype} raw_min={raw_min:.1f} raw_max={raw_max:.1f}"
+                )
+
             self.prev_depth_m = depth_m
             self.prev_rgb = rgb
             return None
@@ -128,6 +153,8 @@ class ProjectedPointToPlaneTracker(Tracker):
         pose = self.poses[-1] @ np.linalg.inv(T_rel_np)
         self.poses.append(pose.astype(np.float32))
         self.prev_rel_T = T_rel.detach()
+
+        self._icp_fail_streak = 0
 
         is_keyframe = False
         if self.last_kf_pose is None:
@@ -141,6 +168,7 @@ class ProjectedPointToPlaneTracker(Tracker):
             self.dataset.rgb_keyframes.append(rgb)
             self.dataset.depth_keyframes.append(depth)
             self.keyframes_poses.append(pose.astype(np.float32))
+            self.keyframe_frame_indices.append(len(self.poses) - 1)
             self.last_kf_pose = pose
             self.dataset.current_keyframe_index += 1
 

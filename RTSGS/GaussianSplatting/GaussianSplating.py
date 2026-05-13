@@ -261,6 +261,165 @@ class GaussianSplatting:
         except Exception:
             return None
 
+    @torch.no_grad()
+    def render_segmentation_rgb_at_pose(self, pose_np: np.ndarray):
+        """
+        Render a segmentation-colored point cloud image for a given camera pose.
+
+        Uses per-point colors from `pcd.segmentation_colors` (Nx3 float in [0,1]) and
+        the SAME RGB camera intrinsics + resolution as `render_rgb_at_pose`, so the
+        FOV matches the camera-side renders.
+
+        Returns uint8 HxWx3 (RGB), or None if segmentation is unavailable.
+        """
+        if self.pcd.all_points is None:
+            return None
+        if pose_np is None:
+            return None
+
+        means = self.pcd.all_points
+        quats = self.pcd.all_quaternions
+        scales = self.pcd.all_scales
+        alpha = self.pcd.all_alpha
+
+        if means is None or means.shape[0] == 0:
+            return None
+
+        seg_colors = getattr(self.pcd, "segmentation_colors", None)
+        if seg_colors is None:
+            return None
+        if torch.is_tensor(seg_colors):
+            seg_colors_t = seg_colors
+        else:
+            seg_colors_t = torch.from_numpy(np.asarray(seg_colors, dtype=np.float32))
+        if seg_colors_t.ndim != 2 or seg_colors_t.shape[1] != 3:
+            return None
+        if int(seg_colors_t.shape[0]) != int(means.shape[0]):
+            return None
+
+        pose = torch.from_numpy(np.asarray(pose_np, dtype=np.float32)).to(self.device)
+
+        T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        T_fix[:3, :3] = self.pcd.R_fix
+        viewmat = torch.inverse(T_fix @ pose).unsqueeze(0)
+
+        K = _build_K(
+            fx=float(self.pcd.rgb_fx),
+            fy=float(self.pcd.rgb_fy),
+            cx=float(self.pcd.rgb_cx),
+            cy=float(self.pcd.rgb_cy),
+            device=self.device,
+        ).unsqueeze(0)
+
+        seg_colors_t = seg_colors_t.to(self.device, dtype=torch.float32).clamp(0.0, 1.0)
+
+        try:
+            img, _, _ = rendering.rasterization(
+                means=means,
+                quats=F.normalize(quats, p=2, dim=-1),
+                scales=torch.exp(scales),
+                opacities=torch.sigmoid(alpha).squeeze(-1),
+                colors=seg_colors_t,
+                viewmats=viewmat,
+                Ks=K,
+                width=self.rgb_width,
+                height=self.rgb_height,
+                render_mode="RGB",
+            )
+        except Exception:
+            return None
+
+        try:
+            out = (img[0].clamp_(0.0, 1.0).mul_(255.0)).to(torch.uint8).cpu().numpy()
+            return out
+        except Exception:
+            return None
+
+    @torch.no_grad()
+    def _compute_visibility_signature(self, pose_np: np.ndarray):
+        if self.pcd.all_points is None or self.pcd.all_points.shape[0] == 0:
+            return None
+
+        if pose_np is None:
+            return None
+
+        pose = torch.from_numpy(np.asarray(pose_np, dtype=np.float32)).to(self.device)
+
+        T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        T_fix[:3, :3] = self.pcd.R_fix
+        viewmat = torch.inverse(T_fix @ pose).unsqueeze(0)
+
+        K = _build_K(
+            fx=float(self.pcd.rgb_fx / self.downsample_factor),
+            fy=float(self.pcd.rgb_fy / self.downsample_factor),
+            cx=float(self.pcd.rgb_cx / self.downsample_factor),
+            cy=float(self.pcd.rgb_cy / self.downsample_factor),
+            device=self.device,
+        ).unsqueeze(0)
+
+        mask = frustum_cull_mask(
+            means_world=self.pcd.all_points.detach(),
+            viewmats=viewmat,
+            Ks=K,
+            width=self.train_width,
+            height=self.train_height,
+            near=self.cull_near,
+            far=self.cull_far,
+            pad=self.cull_pad_px,
+        )
+
+        return mask.detach().cpu().numpy()
+
+    def _ensure_keyframe_covis_masks(self):
+        if not hasattr(self.tracker, "keyframes_covis_masks"):
+            self.tracker.keyframes_covis_masks = []
+
+        kf_masks = self.tracker.keyframes_covis_masks
+        kf_count = len(self.tracker.keyframes_poses)
+
+        if self.pcd.all_points is None or kf_count == 0:
+            return
+
+        if len(kf_masks) > kf_count:
+            del kf_masks[kf_count:]
+
+        start = len(kf_masks)
+        if start >= kf_count:
+            return
+
+        for kf_idx in range(start, kf_count):
+            mask = self._compute_visibility_signature(self.tracker.keyframes_poses[kf_idx])
+            kf_masks.append(mask)
+
+    @staticmethod
+    def _covisibility_score(mask_a, mask_b) -> float:
+        if mask_a is None or mask_b is None:
+            return 0.0
+
+        if torch.is_tensor(mask_a):
+            mask_a = mask_a.detach().cpu().numpy()
+        if torch.is_tensor(mask_b):
+            mask_b = mask_b.detach().cpu().numpy()
+
+        min_len = min(mask_a.shape[0], mask_b.shape[0])
+        if min_len <= 0:
+            return 0.0
+
+        a = mask_a[:min_len]
+        b = mask_b[:min_len]
+
+        inter = int(np.count_nonzero(a & b))
+        if inter == 0:
+            return 0.0
+
+        count_a = int(np.count_nonzero(a))
+        count_b = int(np.count_nonzero(b))
+        denom = min(count_a, count_b)
+        if denom <= 0:
+            return 0.0
+
+        return float(inter) / float(denom)
+
     def _setup_optimizer(self):
         if self.pcd.all_points is None:
             return
@@ -277,8 +436,8 @@ class GaussianSplatting:
         params = [
             {'params': [self.pcd.all_points], 'lr': self.base_lr * self.points_lr_mult, "name": "points"},
             {'params': [self.pcd.all_sh], 'lr': self.base_lr * 3.0, "name": "sh"},
-            {'params': [self.pcd.all_scales], 'lr': self.base_lr * 10.0, "name": "scales"},
-            {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 10.0, "name": "quats"},
+            {'params': [self.pcd.all_scales], 'lr': self.base_lr * 2.0, "name": "scales"},
+            {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 2.0, "name": "quats"},
             {'params': [self.pcd.all_alpha], 'lr': self.base_lr, "name": "alphas"},
         ]
         self.optimizer = torch.optim.Adam(params)
@@ -395,24 +554,29 @@ class GaussianSplatting:
 
         kf_count = len(self.tracker.keyframes_poses)
 
-        # always include newest keyframe + random old keyframes
-        # number of frames to use
-        b = min(2, kf_count)
-
-        # always start with newest frame
+        # Always include the latest keyframe; optionally add a covisible older one.
+        self._ensure_keyframe_covis_masks()
         latest_idx = kf_count - 1
+        sample_idx = np.array([latest_idx], dtype=np.int64)
 
-        if b == 1:
-            sample_idx = np.array([latest_idx])
+        if kf_count > 1:
+            kf_masks = getattr(self.tracker, "keyframes_covis_masks", [])
+            if len(kf_masks) > latest_idx:
+                latest_mask = kf_masks[latest_idx]
+                if latest_mask is not None:
+                    candidates = []
+                    for old_idx in range(latest_idx):
+                        if old_idx >= len(kf_masks):
+                            break
+                        score = self._covisibility_score(latest_mask, kf_masks[old_idx])
+                        if score > 0.0:
+                            candidates.append(old_idx)
+                    if candidates:
+                        old_idx = np.random.choice(candidates, 1, replace=False)
+                        sample_idx = np.concatenate(
+                            (np.array([latest_idx], dtype=np.int64), old_idx.astype(np.int64))
+                        )
 
-        else:
-            if np.random.rand() < 0.8:
-                # 80%: only optimize latest frame (fast convergence)
-                sample_idx = np.array([latest_idx])
-            else:
-                # 20%: latest + one random older frame
-                old_idx = np.random.choice(kf_count - 1, 1, replace=False)
-                sample_idx = np.concatenate(([latest_idx], old_idx))
         b = len(sample_idx)
         gt_rgb_np = [self.dataset.rgb_keyframes[i] for i in sample_idx]
         can_use_depth = (

@@ -8,6 +8,8 @@ class Tracker(ABC):
     def __init__(self,dataset:DataLoader,config:Config):
         self.poses = []
         self.keyframes_poses=[]
+        self.keyframe_frame_indices = []
+        self.keyframes_covis_masks = []
         self.config = config
         self.dataset = dataset
 

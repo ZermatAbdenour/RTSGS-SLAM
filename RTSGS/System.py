@@ -12,6 +12,9 @@ from RTSGS.SceneGraph import RealtimeSceneGraphRuntime
 
 import cv2
 import numpy as np
+import traceback
+
+from RTSGS.Benchmarking.BenchmarkCollector import BenchmarkCollector
 
 class RTSGSSystem:
     def __init__(self, dataset: DataLoader, tracker: Tracker, config):
@@ -69,6 +72,17 @@ class RTSGSSystem:
         # Track the last keyframe index added to the map
         self.last_added_keyframe_idx = -1
 
+        # Throttle semantic segmentation: run once every N keyframes.
+        self.semantic_update_stride = max(
+            1,
+            int(config.get("semantic_update_stride", config.get("scenegraph_update_stride", 1))),
+        )
+        self._last_enqueued_semantic_kf = -1
+
+        # Benchmarking (enabled only when run(benchmark=True))
+        self.benchmark: BenchmarkCollector | None = None
+        self._trajectory_done = False
+
 
     def run(self, benchmark: bool = False):
         self._worker.start()
@@ -78,8 +92,23 @@ class RTSGSSystem:
 
         # Enable benchmark window if requested
         if benchmark:
+            self.benchmark = BenchmarkCollector(enabled=True)
+            self.benchmark.reset_total_peak()
+            # Expose the collector to the modules that can self-instrument.
             try:
-                self.window.enable_benchmark_window(self.gs, self.dataset)
+                self.pcd.benchmark = self.benchmark
+            except Exception:
+                pass
+            try:
+                self.segmenter.benchmark = self.benchmark
+            except Exception:
+                pass
+            try:
+                self.scene_graph.benchmark = self.benchmark
+            except Exception:
+                pass
+            try:
+                self.window.enable_benchmark_window(self.gs, self.dataset, tracker=self.tracker, bench=self.benchmark)
             except Exception:
                 pass
 
@@ -88,6 +117,12 @@ class RTSGSSystem:
 
             # 1. Process streaming data and track
             frame = self.process_stream_frame()
+
+            # Mark end-of-trajectory once the dataset is exhausted.
+            if benchmark and not self._trajectory_done and self._dataset_exhausted():
+                self._trajectory_done = True
+                if self.benchmark is not None:
+                    self.benchmark.mark_trajectory_ended()
             
             # 2. Run a training step (Optimization)
             # This is now throttled internally by your max_steps_per_sec logic
@@ -111,17 +146,26 @@ class RTSGSSystem:
                     break
 
                 # Queue semantic fusion asynchronously in the segmenter worker.
-                with self._seg_cv:
-                    self._seg_pending.append(
-                        (
-                            self.dataset.rgb_keyframes[next_kf],
-                            self.dataset.depth_keyframes[next_kf],
-                            self.tracker.keyframes_poses[next_kf],
-                            int(next_kf),
+                should_enqueue_semantic = (
+                    self._last_enqueued_semantic_kf < 0
+                    or (int(next_kf) - int(self._last_enqueued_semantic_kf)) >= int(self.semantic_update_stride)
+                )
+                if should_enqueue_semantic:
+                    with self._seg_cv:
+                        self._seg_pending.append(
+                            (
+                                self.dataset.rgb_keyframes[next_kf],
+                                self.dataset.depth_keyframes[next_kf],
+                                self.tracker.keyframes_poses[next_kf],
+                                int(next_kf),
+                            )
                         )
-                    )
-                    q_size = int(len(self._seg_pending))
-                    self._seg_cv.notify()
+                        q_size = int(len(self._seg_pending))
+                        self._seg_cv.notify()
+                    self._last_enqueued_semantic_kf = int(next_kf)
+                else:
+                    with self._seg_cv:
+                        q_size = int(len(self._seg_pending))
 
                 with self.pcd.lock:
                     self.pcd.segmentation_queue_size = q_size
@@ -132,6 +176,10 @@ class RTSGSSystem:
             # 4. Visualization and GUI
             self.tracker.visualize_tracking()
             self.window.render_frame()
+
+            # Finalize the benchmark once the stream is done and workers drained.
+            if benchmark and self.benchmark is not None:
+                self._maybe_finalize_benchmark()
 
         # Shutdown sequence
         with self._cv:
@@ -158,15 +206,72 @@ class RTSGSSystem:
         if frame_paths is None:
             return None
         
-        # Read color and depth img
-        rgb = cv2.imread(frame_paths[0], cv2.IMREAD_COLOR)
-        depth = cv2.imread(frame_paths[1], cv2.IMREAD_UNCHANGED).astype(np.float32)
+        # Read color and depth img (robust to missing/unreadable frames)
+        rgb_path = frame_paths[0]
+        depth_path = frame_paths[1] if len(frame_paths) > 1 else None
+
+        rgb = cv2.imread(rgb_path, cv2.IMREAD_COLOR)
+        if rgb is None:
+            print(f"[System] Warning: failed to read RGB: {rgb_path}")
+            return None
+
+        depth = None
+        if depth_path is not None:
+            depth_raw = cv2.imread(depth_path, cv2.IMREAD_UNCHANGED)
+            if depth_raw is None:
+                print(f"[System] Warning: failed to read depth: {depth_path}")
+                return None
+            if depth_raw.ndim == 3:
+                depth_raw = depth_raw[..., 0]
+            depth = depth_raw.astype(np.float32)
         
         with self._cv:
             self._pending = (rgb, depth)
             self._busy = True
             self._cv.notify()
         return (rgb, depth)
+
+    def _dataset_exhausted(self) -> bool:
+        """True when the streaming loader has served all frames."""
+        try:
+            pairs = getattr(self.dataset, "RGBD_pairs", None)
+            cur = int(getattr(self.dataset, "current_frame_index", -1))
+            if pairs is None or cur < 0:
+                return False
+            return cur >= int(len(pairs))
+        except Exception:
+            return False
+
+    def _maybe_finalize_benchmark(self) -> None:
+        """Finalize benchmark numbers once no background work remains."""
+        b = self.benchmark
+        if b is None or not b.enabled or b.finalized:
+            return
+        if not self._trajectory_done:
+            return
+
+        # Wait for tracker worker, mapping executor, and segmenter queue to drain.
+        with self._cv:
+            tracker_idle = (not self._busy) and (self._pending is None)
+        with self._seg_cv:
+            seg_queue_empty = len(self._seg_pending) == 0
+            seg_idle = (not self._seg_busy)
+
+        mapping_drained = True
+        try:
+            next_kf = int(self.last_added_keyframe_idx) + 1
+            mapping_drained = next_kf >= int(getattr(self.dataset, "current_keyframe_index", 0))
+        except Exception:
+            mapping_drained = True
+
+        pcd_idle = True
+        try:
+            pcd_idle = not bool(getattr(self.pcd, "is_processing", False))
+        except Exception:
+            pcd_idle = True
+
+        if tracker_idle and seg_queue_empty and seg_idle and mapping_drained and pcd_idle:
+            b.finalize(pcd=self.pcd, segmenter=self.segmenter, scene_graph=self.scene_graph)
 
     def _worker_loop(self):
         while True:
@@ -181,9 +286,25 @@ class RTSGSSystem:
                 self._pending = None
 
             try:
-                # The tracker updates dataset.current_keyframe_index internally 
+                # The tracker updates dataset.current_keyframe_index internally
                 # when a new keyframe is detected.
-                self.tracker.track_frame(img, depth)
+                if self.benchmark is not None and self.benchmark.enabled:
+                    t0 = time.perf_counter()
+                    try:
+                        self.tracker.track_frame(img, depth)
+                    finally:
+                        dt_ms = (time.perf_counter() - t0) * 1000.0
+                        self.benchmark.record_ms(BenchmarkCollector.STAGE_TRACKING, dt_ms)
+                        try:
+                            self.benchmark.observe_total_peak()
+                        except Exception:
+                            pass
+                else:
+                    self.tracker.track_frame(img, depth)
+            except Exception:
+                # Never let the worker thread die silently; otherwise _busy can
+                # get stuck true and the stream appears frozen.
+                print("[System] Tracker worker exception:\n" + traceback.format_exc())
             finally:
                 with self._cv:
                     self._busy = False
@@ -215,6 +336,8 @@ class RTSGSSystem:
                         self.pcd.scene_graph_last_error = str(scene_e)
                     print(f"Scene graph worker error: {scene_e}")
                 self._seg_last_total_ms = float((time.perf_counter() - t0) * 1000.0)
+                if self.benchmark is not None and self.benchmark.enabled:
+                    self.benchmark.record_ms(BenchmarkCollector.STAGE_END_TO_END, float(self._seg_last_total_ms))
                 self._seg_last_kf_index = int(kf_index)
                 self._seg_processed_count += 1
                 self._seg_last_error = ""

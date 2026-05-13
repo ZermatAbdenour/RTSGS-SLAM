@@ -45,6 +45,9 @@ class YOLOSemanticSegmenter:
         self._palette_t = None
         self._grid_cache = {}
 
+        # Optional benchmark collector (set by System when benchmark=True)
+        self.benchmark = None
+
     def _abs_path(self, p: str) -> str:
         if os.path.isabs(p):
             return p
@@ -241,7 +244,36 @@ class YOLOSemanticSegmenter:
         rgb_np = rgb_np[..., ::-1].copy()
         inputs = self._processor(images=rgb_np, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
-        outputs = self._model(**inputs)
+
+        bench = getattr(self, "benchmark", None)
+        do_bench = bool(getattr(bench, "enabled", False))
+        if do_bench:
+            # Wall-time of the forward pass; synchronize to include CUDA time.
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            t_fwd0 = time.perf_counter()
+            outputs = self._model(**inputs)
+            try:
+                if torch.cuda.is_available():
+                    torch.cuda.synchronize()
+            except Exception:
+                pass
+            fwd_ms = (time.perf_counter() - t_fwd0) * 1000.0
+            try:
+                from RTSGS.Benchmarking.BenchmarkCollector import BenchmarkCollector
+
+                try:
+                    bench.observe_total_peak()
+                except Exception:
+                    pass
+                bench.record_ms(BenchmarkCollector.STAGE_MASK2FORMER_FWD, float(fwd_ms))
+            except Exception:
+                pass
+        else:
+            outputs = self._model(**inputs)
         feature_map = self._get_feature_map(outputs)
         if isinstance(feature_map, torch.Tensor):
             feature_map = feature_map
@@ -519,7 +551,9 @@ class YOLOSemanticSegmenter:
                 {
                     "seg_id": int(seg_id),
                     "class_id": int(local_class_id),
-                    "instance_id": int(local_class_id),
+                    # instance_id is assigned by PointCloud._update_instances_from_predictions
+                    # via spatial association so detections persist across frames.
+                    "instance_id": -1,
                     "confidence": float(seg_score),
                     "gaussian_indices": g_idx,
                     "object_feature": obj_feature,
@@ -590,8 +624,11 @@ class YOLOSemanticSegmenter:
             for pred in ranked_pred:
                 seg_id = int(pred.get("seg_id", -1))
                 inst_id = int(pred.get("instance_id", -1))
+                # Skip candidates that didn't get a tracked instance id (filtered by
+                # min-points / association). No more class-id fallback that collapses
+                # multiple objects of the same class into one.
                 if inst_id < 0:
-                    inst_id = int(pred.get("class_id", -1))
+                    continue
                 g_idx = pred.get("gaussian_indices", None)
                 obj_feat = pred.get("object_feature", None)
                 if seg_id < 0 or g_idx is None:

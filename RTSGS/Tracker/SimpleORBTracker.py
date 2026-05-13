@@ -52,6 +52,7 @@ class SimpleORBTracker(Tracker):
                 if depth is not None:
                     self.dataset.depth_keyframes.append(depth)
                 self.keyframes_poses.append(init_pose)
+                self.keyframe_frame_indices.append(0)
                 self.last_kf_pose = init_pose
                 self.dataset.current_keyframe_index += 1
             return None
@@ -184,6 +185,7 @@ class SimpleORBTracker(Tracker):
             if depth is not None:
                 self.dataset.depth_keyframes.append(depth)
             self.keyframes_poses.append(pose.astype(np.float32))
+            self.keyframe_frame_indices.append(len(self.poses) - 1)
             self.last_kf_pose = pose
             self.dataset.current_keyframe_index+=1
 

@@ -1,3 +1,6 @@
 [submodule "Datasets/Replica/ThirdParty/Replica-Dataset"]
 	path = Datasets/Replica/ThirdParty/Replica-Dataset
 	url = https://github.com/facebookresearch/Replica-Dataset.git
+[submodule "ThirdParty/OpenPSG"]
+	path = ThirdParty/OpenPSG
+	url = https://github.com/Jingkang50/OpenPSG.git

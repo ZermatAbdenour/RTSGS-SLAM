@@ -18,8 +18,7 @@ class ICPORBTracker(Tracker):
     """
 
     def __init__(self, dataset: DataLoader, config, Orb_features=3000):
-        super().__init__()
-        self.dataset = dataset
+        super().__init__(dataset, config)
 
         # intrinsics
         K_depth = config.get_depth_intrinsics()
@@ -84,6 +83,7 @@ class ICPORBTracker(Tracker):
                     if depth is not None:
                         self.dataset.depth_keyframes.append(depth)
                     self.keyframes_poses.append(init_pose)
+                    self.keyframe_frame_indices.append(0)
                     self.last_kf_pose = init_pose
                     self.dataset.current_keyframe_index += 1
             return None
@@ -222,6 +222,7 @@ class ICPORBTracker(Tracker):
             if depth is not None:
                 self.dataset.depth_keyframes.append(depth)
             self.keyframes_poses.append(pose.astype(np.float32))
+            self.keyframe_frame_indices.append(len(self.poses) - 1)
             self.last_kf_pose = pose
             self.dataset.current_keyframe_index += 1
 

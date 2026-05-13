@@ -1,4 +1,5 @@
 import threading
+import time
 
 import numpy as np
 import torch
@@ -91,6 +92,7 @@ class PointCloud:
         self.instance_bbox_merge_center_gate_m = float(config.get("instance_bbox_merge_center_gate_m", 0.25))
         self._instance_next_id = 1
         self._instance_frame_idx = 0
+        self._instance_track_meta: dict[int, dict] = {}
 
         # Real-time scene graph outputs.
         self.scene_graph_state = {}
@@ -114,6 +116,9 @@ class PointCloud:
         self.is_processing = False
         self.lock = threading.Lock()
         self.rendered_depth_provider = None
+
+        # Optional benchmark collector (set by System when benchmark=True)
+        self.benchmark = None
 
     def set_rendered_depth_provider(self, provider):
         """Set callable provider: provider(pose_4x4_np) -> depth_m (H,W) or None."""
@@ -273,9 +278,55 @@ class PointCloud:
 
         def _task():
             try:
+                bench = getattr(self, "benchmark", None)
+                do_bench = bool(getattr(bench, "enabled", False))
+                alloc0 = None
+                if do_bench:
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available():
+                            # Preserve run-wide peak before doing any per-stage reset.
+                            try:
+                                bench.observe_total_peak()
+                            except Exception:
+                                pass
+                            torch.cuda.synchronize()
+                            # Reset peak stats so mapping peak is mapping-specific.
+                            torch.cuda.reset_peak_memory_stats()
+                            torch.cuda.synchronize()
+                            alloc0 = int(torch.cuda.memory_allocated())
+                    except Exception:
+                        alloc0 = None
+
+                t0 = time.perf_counter() if do_bench else None
                 new_data = self.process_single_keyframe(rgb_np, depth_np, pose_np, rendered_depth_np)
                 if new_data is not None:
                     self._merge_data(new_data)
+
+                if do_bench and t0 is not None:
+                    dt_ms = (time.perf_counter() - t0) * 1000.0
+                    try:
+                        from RTSGS.Benchmarking.BenchmarkCollector import BenchmarkCollector
+
+                        bench.record_ms(BenchmarkCollector.STAGE_MAPPING, float(dt_ms))
+                    except Exception:
+                        pass
+
+                    # Track mapping activation peak as a peak-alloc delta over the baseline.
+                    try:
+                        import torch
+
+                        if torch.cuda.is_available() and alloc0 is not None:
+                            torch.cuda.synchronize()
+                            peak_map = int(torch.cuda.max_memory_allocated())
+                            try:
+                                bench.observe_total_peak_value(peak_map)
+                            except Exception:
+                                pass
+                            bench.update_mapping_activation_peak(int(max(0, peak_map - int(alloc0))))
+                    except Exception:
+                        pass
             finally:
                 self.is_processing = False
 
@@ -593,12 +644,25 @@ class PointCloud:
                 }
             )
 
+        # Carry tracking metadata (missed_frames, last_seen_frame) across rebuilds.
+        track_meta = getattr(self, "_instance_track_meta", {}) or {}
+        for inst_dict in out:
+            iid = int(inst_dict["instance_id"])
+            meta = track_meta.get(iid)
+            if meta is not None:
+                inst_dict["missed_frames"] = int(meta.get("missed_frames", 0))
+                inst_dict["last_seen_frame"] = int(meta.get("last_seen_frame", self._instance_frame_idx))
+            else:
+                inst_dict["missed_frames"] = 0
+                inst_dict["last_seen_frame"] = int(self._instance_frame_idx)
+
         out.sort(key=lambda x: x["instance_id"])
         self.segmentation_instances = out
 
     def _update_instances_from_predictions(self, pred_instances, n_map: int):
-        # Class-level association: each semantic class is represented by one instance
-        # and the instance id is the class id.
+        """Multi-instance tracking: associate each candidate to an existing instance
+        of the same class via 3D bbox IoU + center distance, otherwise spawn a new id.
+        Drops instances unseen for `instance_max_missed_frames` frames."""
 
         if self.gaussian_instance_ids is None:
             return
@@ -606,12 +670,15 @@ class PointCloud:
         if not isinstance(self.segmentation_instances, list):
             self.segmentation_instances = []
 
-        # Build an index of existing instances by class id.
-        existing_by_class: dict[int, dict] = {}
+        self._instance_frame_idx += 1
+        cur_frame = int(self._instance_frame_idx)
+
+        # Snapshot of existing instances keyed by id (used for spatial matching).
+        existing: dict[int, dict] = {}
         for inst in self.segmentation_instances:
             iid = int(inst.get("instance_id", -1))
             cls_id = int(inst.get("class_id", -1))
-            if iid < 0 or cls_id < 0:
+            if iid < 0:
                 continue
             bmin_list = inst.get("bbox_min", None)
             bmax_list = inst.get("bbox_max", None)
@@ -619,26 +686,24 @@ class PointCloud:
                 continue
             if len(bmin_list) != 3 or len(bmax_list) != 3:
                 continue
-
             ibmin = torch.tensor(bmin_list, device=self.device, dtype=torch.float32)
             ibmax = torch.tensor(bmax_list, device=self.device, dtype=torch.float32)
-            icenter = 0.5 * (ibmin + ibmax)
-            existing_by_class[cls_id] = {
-                "instance_id": cls_id,
+            existing[iid] = {
+                "instance_id": iid,
+                "class_id": cls_id,
                 "bmin": ibmin,
                 "bmax": ibmax,
-                "center": icenter,
+                "center": 0.5 * (ibmin + ibmax),
+                "missed_frames": int(inst.get("missed_frames", 0)),
+                "last_seen_frame": int(inst.get("last_seen_frame", cur_frame)),
             }
 
-        # Build candidates (class-centric; every class shares one instance id).
+        # Filter and shape candidates.
         candidates = []
         raw_candidates = pred_instances if isinstance(pred_instances, list) else []
         for cand in raw_candidates:
-            if not isinstance(cand, dict):
+            if not isinstance(cand, dict) or "gaussian_indices" not in cand:
                 continue
-            if "gaussian_indices" not in cand:
-                continue
-
             idx = cand["gaussian_indices"]
             if not isinstance(idx, torch.Tensor):
                 idx = torch.as_tensor(idx, device=self.device)
@@ -646,79 +711,122 @@ class PointCloud:
             idx = idx[(idx >= 0) & (idx < n_map)]
             if idx.numel() == 0:
                 continue
-
             idx = torch.unique(idx)
             if int(idx.numel()) < int(self.instance_min_points):
                 continue
-
             cls_id = int(cand.get("class_id", -1))
             if cls_id < 0:
                 continue
-            score = float(cand.get("confidence", 0.0))
-
             box = self._instance_bbox(idx)
             if box is None:
                 continue
             bmin, bmax, center = box
-
             candidates.append(
                 {
                     "cand": cand,
                     "idx": idx,
                     "cls_id": cls_id,
-                    "score": score,
-                    "bmin": bmin,
-                    "bmax": bmax,
-                    "center": center,
+                    "score": float(cand.get("confidence", 0.0)),
+                    "bmin": bmin.to(dtype=torch.float32),
+                    "bmax": bmax.to(dtype=torch.float32),
+                    "center": center.to(dtype=torch.float32),
                 }
             )
 
-        # Deterministic tolerance derived from voxel size (not a tunable hyperparameter).
-        eps = float(max(self.voxel_size * 2.0, 1e-3))
-        eps_t = torch.tensor(eps, device=self.device, dtype=torch.float32)
+        # Highest-confidence candidates pick first.
+        candidates.sort(key=lambda item: item["score"], reverse=True)
 
-        # Stronger predictions get first pick on available geometry updates.
-        candidates.sort(key=lambda item: float(item["score"]), reverse=True)
+        iou_gate = float(max(0.0, self.instance_iou_gate))
+        center_gate = float(max(0.0, self.instance_center_gate_m))
+        matched_ids: set[int] = set()
+
+        overlap_gate = float(max(0.0, self.instance_overlap_gate))
 
         for c in candidates:
-            cand = c["cand"]
-            idx = c["idx"]
-            cls_id = int(c["cls_id"])
-            center = c["center"].to(dtype=torch.float32)
-            cand_bmin = c["bmin"].to(dtype=torch.float32)
-            cand_bmax = c["bmax"].to(dtype=torch.float32)
+            cls_id = c["cls_id"]
+            cand_idx = c["idx"]
+            cand_size = int(cand_idx.numel())
+            best_iid = -1
 
-            best_id: int | None = int(cls_id)
-
-            # Preserve any existing class-level instance IDs inside this mask.
-            prev_ids_full = self.gaussian_instance_ids[idx]
-            assigned_mask = prev_ids_full >= 0
+            # PRIMARY: 3D Gaussian-overlap matching. If this detection's points are
+            # already assigned to an existing instance, merge with it — even across
+            # classes (Mask2Former labels can flip on a single object frame-to-frame).
+            prior_ids = self.gaussian_instance_ids[cand_idx]
+            assigned_mask = prior_ids >= 0
             if torch.any(assigned_mask):
-                prev_ids = prev_ids_full[assigned_mask]
-                if prev_ids.numel() > 0:
-                    prev_ids_full[assigned_mask] = int(cls_id)
-            new_idx = idx[~assigned_mask]
+                unique_ids, counts = torch.unique(prior_ids[assigned_mask], return_counts=True)
+                # Largest existing-instance footprint inside this candidate.
+                top = int(torch.argmax(counts).item())
+                cand_overlap_iid = int(unique_ids[top].item())
+                cand_overlap_count = int(counts[top].item())
+                cand_overlap_frac = cand_overlap_count / max(cand_size, 1)
+                if cand_overlap_iid not in matched_ids and cand_overlap_frac >= overlap_gate:
+                    best_iid = cand_overlap_iid
 
-            # Ensure the whole candidate is written to the class-level instance id.
-            cand["instance_id"] = int(best_id)
-            if new_idx.numel() > 0:
-                self.gaussian_instance_ids[new_idx] = int(best_id)
+            # FALLBACK: bbox IoU + center-distance, restricted to same class.
+            if best_iid < 0:
+                best_score = -1.0
+                for iid, ex in existing.items():
+                    if iid in matched_ids or int(ex["class_id"]) != cls_id:
+                        continue
+                    iou = self._bbox_iou_3d(ex["bmin"], ex["bmax"], c["bmin"], c["bmax"])
+                    dist = float(torch.linalg.norm(ex["center"] - c["center"]).item())
+                    iou_ok = iou >= iou_gate
+                    center_ok = (center_gate > 0.0) and (dist <= center_gate)
+                    if not (iou_ok or center_ok):
+                        continue
+                    norm_dist = min(dist / max(center_gate, 1e-6), 1.0) if center_gate > 0.0 else 1.0
+                    match_score = iou + (1.0 - norm_dist) * 0.25
+                    if match_score > best_score:
+                        best_score = match_score
+                        best_iid = iid
 
-            if best_id in existing_by_class:
-                inst = existing_by_class[best_id]
-                # Update the stored class instance with the latest geometry.
-                inst["bmin"] = torch.minimum(inst["bmin"], cand_bmin)
-                inst["bmax"] = torch.maximum(inst["bmax"], cand_bmax)
-                inst["center"] = 0.5 * (inst["bmin"] + inst["bmax"])
+            if best_iid >= 0:
+                assigned = best_iid
             else:
-                existing_by_class[best_id] = {
-                    "instance_id": int(best_id),
-                    "bmin": cand_bmin,
-                    "bmax": cand_bmax,
-                    "center": center,
+                assigned = int(self._instance_next_id)
+                self._instance_next_id += 1
+                existing[assigned] = {
+                    "instance_id": assigned,
+                    "class_id": cls_id,
+                    "bmin": c["bmin"],
+                    "bmax": c["bmax"],
+                    "center": c["center"],
+                    "missed_frames": 0,
+                    "last_seen_frame": cur_frame,
                 }
+            matched_ids.add(assigned)
 
-        # Refresh instance snapshots from current point assignments.
+            # Overwrite gaussian assignments inside this candidate's mask.
+            self.gaussian_instance_ids[c["idx"]] = int(assigned)
+            c["cand"]["instance_id"] = int(assigned)
+
+            ex = existing[assigned]
+            ex["bmin"] = torch.minimum(ex["bmin"], c["bmin"])
+            ex["bmax"] = torch.maximum(ex["bmax"], c["bmax"])
+            ex["center"] = 0.5 * (ex["bmin"] + ex["bmax"])
+
+        # TTL: increment missed_frames on unmatched, drop those past the budget.
+        max_missed = int(self.instance_max_missed_frames)
+        for iid in list(existing.keys()):
+            ex = existing[iid]
+            if iid in matched_ids:
+                ex["missed_frames"] = 0
+                ex["last_seen_frame"] = cur_frame
+            else:
+                ex["missed_frames"] = int(ex.get("missed_frames", 0)) + 1
+                if ex["missed_frames"] > max_missed:
+                    drop = self.gaussian_instance_ids == iid
+                    if torch.any(drop):
+                        self.gaussian_instance_ids[drop] = -1
+                    del existing[iid]
+
+        # Tracking metadata persists across snapshot rebuilds.
+        self._instance_track_meta = {
+            iid: {"missed_frames": ex["missed_frames"], "last_seen_frame": ex["last_seen_frame"]}
+            for iid, ex in existing.items()
+        }
+
         self._rebuild_instances_snapshot()
 
     def _merge_overlapping_instances(self):
@@ -752,10 +860,9 @@ class PointCloud:
                     b_center = 0.5 * (b_min + b_max)
                     center_dist = float(torch.linalg.norm(a_center - b_center).item())
 
-                    should_merge = (
-                        iou >= float(self.instance_bbox_merge_iou)
-                        or (iou >= 0.05 and center_dist <= float(self.instance_bbox_merge_center_gate_m))
-                    )
+                    # Only merge highly-overlapping bboxes of the same class — otherwise
+                    # distinct instances (two chairs near each other) would collapse.
+                    should_merge = iou >= float(self.instance_bbox_merge_iou)
                     if not should_merge:
                         j += 1
                         continue
@@ -988,7 +1095,20 @@ class PointCloud:
             self.segmentation_colors = colors
             self.segmentation_color_logits = logits
             if pred_instances is not None:
-                self._update_instances_from_predictions(pred_instances, n_map)
+                bench = getattr(self, "benchmark", None)
+                do_bench = bool(getattr(bench, "enabled", False))
+                if do_bench:
+                    t_assoc0 = time.perf_counter()
+                    self._update_instances_from_predictions(pred_instances, n_map)
+                    assoc_ms = (time.perf_counter() - t_assoc0) * 1000.0
+                    try:
+                        from RTSGS.Benchmarking.BenchmarkCollector import BenchmarkCollector
+
+                        bench.record_ms(BenchmarkCollector.STAGE_INSTANCE_ASSOC, float(assoc_ms))
+                    except Exception:
+                        pass
+                else:
+                    self._update_instances_from_predictions(pred_instances, n_map)
             elif not isinstance(self.segmentation_instances, list):
                 self.segmentation_instances = []
 

@@ -81,10 +81,10 @@ class WindowManager:
         self._last_time = None
         self._delta_time = 0.016
 
-    def enable_benchmark_window(self, gs, dataset):
+    def enable_benchmark_window(self, gs, dataset, tracker=None, bench=None):
         """Create the benchmark window (on-demand)."""
         if self.benchmark_window is None:
-            self.benchmark_window = BenchmarkWindow(gs, dataset)
+            self.benchmark_window = BenchmarkWindow(gs, dataset, tracker=tracker, bench=bench)
 
     def _on_window_resize(self, window, width, height):
         self.width = max(1, int(width))
