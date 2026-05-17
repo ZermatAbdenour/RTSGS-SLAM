@@ -47,7 +47,7 @@ class Renderer:
         self._last_color_mode = False
         self._last_segmentation_version = -1
         self._last_segmentation_filter = None
-        self.show_instance_bboxes = True
+        self.show_instance_bboxes = False
 
         self.instance_bbox_vao = None
         self.instance_bbox_vbo = None
