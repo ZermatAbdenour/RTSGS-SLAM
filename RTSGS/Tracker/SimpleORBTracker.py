@@ -1,4 +1,3 @@
-from RTSGS.Config.Config import Config
 from RTSGS.DataLoader.DataLoader import DataLoader
 from RTSGS.Tracker.Tracker import Tracker
 import numpy as np
@@ -9,22 +8,20 @@ from imgui_bundle import imgui, implot
 
 class SimpleORBTracker(Tracker):
 
-    def __init__(self,dataset:DataLoader,config:Config, Orb_features=1000):
-        super().__init__(dataset,config)
+    def __init__(self, dataset: DataLoader, config, Orb_features=1000):
+        super().__init__(dataset, config)
         K_depth = config.get_depth_intrinsics()
         self.fx, self.fy = float(K_depth[0, 0]), float(K_depth[1, 1])
         self.cx, self.cy = float(K_depth[0, 2]), float(K_depth[1, 2])
         self.K = K_depth
 
-        self.depth_scale = config.get('depth_scale')
+        self.depth_scale = config.camera.depth_scale
         self.orb = cv2.ORB_create(nfeatures=Orb_features)
         self.bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=True)
 
-        self.poses = [dataset.gt_poses[0 ]]
-        #keyframes
-        # keyframe thresholds
-        self.alpha = config.get("kf_translation", 0.05)
-        self.theta = config.get("kf_rotation", 5.0 * np.pi / 180.0) 
+        self.poses = [dataset.gt_poses[0]]
+        self.alpha = config.tracker.kf_translation
+        self.theta = config.tracker.kf_rotation
 
         self.last_kf_pose = None
 

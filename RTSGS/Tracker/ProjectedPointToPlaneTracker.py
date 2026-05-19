@@ -26,29 +26,30 @@ class ProjectedPointToPlaneTracker(Tracker):
         K_depth = config.get_depth_intrinsics()
         self.fx, self.fy = float(K_depth[0, 0]), float(K_depth[1, 1])
         self.cx, self.cy = float(K_depth[0, 2]), float(K_depth[1, 2])
-        self.depth_scale = float(config.get("depth_scale"))
+        self.depth_scale = float(config.camera.depth_scale)
 
-        self.alpha = float(config.get("kf_translation", 0.05))
-        self.theta = float(config.get("kf_rotation", 5.0 * np.pi / 180.0))
+        t = config.tracker
+        self.alpha = float(t.kf_translation)
+        self.theta = float(t.kf_rotation)
 
-        self.icp_stride = int(config.get("icp_stride", 4))
-        self.icp_max_iters = int(config.get("icp_max_iters", 12))
-        self.icp_corr_dist = float(config.get("icp_corr_dist", 0.12))
-        self.icp_min_pairs = int(config.get("icp_min_pairs", 1200))
-        self.icp_huber_delta = float(config.get("icp_huber_delta", 0.02))
-        self.icp_damping = float(config.get("icp_damping", 1e-5))
-        self.icp_plane_residual_max = float(config.get("icp_plane_residual_max", 0.04))
-        self.icp_use_projective = bool(config.get("icp_use_projective", True))
-        self.icp_proj_depth_max_diff = float(config.get("icp_proj_depth_max_diff", 0.08))
-        self.depth_min = float(config.get("depth_min", 0.10))
-        self.depth_max = float(config.get("depth_max", 8.0))
+        self.icp_stride = int(t.icp_stride)
+        self.icp_max_iters = int(t.icp_max_iters)
+        self.icp_corr_dist = float(t.icp_corr_dist)
+        self.icp_min_pairs = int(t.icp_min_pairs)
+        self.icp_huber_delta = float(t.icp_huber_delta)
+        self.icp_damping = float(t.icp_damping)
+        self.icp_plane_residual_max = float(t.icp_plane_residual_max)
+        self.icp_use_projective = bool(t.icp_use_projective)
+        self.icp_proj_depth_max_diff = float(t.icp_proj_depth_max_diff)
+        self.depth_min = float(t.depth_min)
+        self.depth_max = float(t.depth_max)
 
-        self.depth_median_ksize = int(config.get("depth_median_ksize", 5))
-        self.depth_bilateral_d = int(config.get("depth_bilateral_d", 5))
-        self.depth_bilateral_sigma_color = float(config.get("depth_bilateral_sigma_color", 0.04))
-        self.depth_bilateral_sigma_space = float(config.get("depth_bilateral_sigma_space", 2.0))
+        self.depth_median_ksize = int(t.depth_median_ksize)
+        self.depth_bilateral_d = int(t.depth_bilateral_d)
+        self.depth_bilateral_sigma_color = float(t.depth_bilateral_sigma_color)
+        self.depth_bilateral_sigma_space = float(t.depth_bilateral_sigma_space)
 
-        cuda_index = int(config.get("cuda_device", 0))
+        cuda_index = int(t.cuda_device)
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{cuda_index}")
         else:
@@ -61,7 +62,7 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.prev_rgb: np.ndarray | None = None
         self.prev_rel_T = torch.eye(4, dtype=torch.float32, device=self.device)
         self.rendered_depth_provider = None
-        self.use_rendered_depth_icp = bool(config.get("use_rendered_depth_icp", True))
+        self.use_rendered_depth_icp = bool(config.tracker.use_rendered_depth_icp)
         self.last_ref_depth_source = "prev"
 
         self.viz_img = None

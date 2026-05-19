@@ -30,23 +30,22 @@ class PointCloud:
         self.R_depth_to_rgb = torch.from_numpy(T_depth_to_rgb[:3, :3]).to(self.device).float()
         self.t_depth_to_rgb = torch.from_numpy(T_depth_to_rgb[:3, 3]).to(self.device).float()
 
-        self.depth_scale = float(config.get("depth_scale", 1.0))
-        self.voxel_size = float(config.get("voxel_size", 0.02))
-        self.novelty_voxel = float(config.get("novelty_voxel", self.voxel_size))
-        self.projection_depth_diff_threshold_m = float(config.get("projection_depth_diff_threshold_m", 0.10))
+        gs = config.gaussian_splatting
+        self.depth_scale = float(config.camera.depth_scale)
+        self.voxel_size = float(gs.voxel_size)
+        self.novelty_voxel = float(gs.novelty_voxel)
+        self.projection_depth_diff_threshold_m = float(gs.projection_depth_diff_threshold_m)
 
-        # SH Parameters
-        self.sh_degree = int(config.get("sh_degree", 1))
+        self.sh_degree = int(gs.sh_degree)
         self.num_sh_bases = (self.sh_degree + 1) ** 2
-        
-        # Gaussian Properties
-        self.sigma_px = float(config.get("sigma_px", 4.0))
-        self.sigma_z0 = float(config.get("sigma_z0", 0.005))
-        self.sigma_z1 = float(config.get("sigma_z1", 0.0))
-        self.alpha_init = float(config.get("alpha_init", 1.0))
-        self.alpha_min = float(config.get("alpha_min", 0.01))
-        self.alpha_max = float(config.get("alpha_max", 1.0))
-        self.alpha_depth_scale = float(config.get("alpha_depth_scale", 0.0))
+
+        self.sigma_px = float(gs.sigma_px)
+        self.sigma_z0 = float(gs.sigma_z0)
+        self.sigma_z1 = float(gs.sigma_z1)
+        self.alpha_init = float(gs.alpha_init)
+        self.alpha_min = float(gs.alpha_min)
+        self.alpha_max = float(gs.alpha_max)
+        self.alpha_depth_scale = float(gs.alpha_depth_scale)
 
         self.all_points = None
         self.all_sh = None
@@ -69,27 +68,28 @@ class PointCloud:
         self.segmentation_version = 0
         self.segmentation_debug_image_bgr = None
         self.segmentation_debug_timestamp = 0.0
-        self.semantic_decay_factor = float(config.get("semantic_decay_factor", 0.2))
-        self.semantic_challenger_decay_factor = float(config.get("semantic_challenger_decay_factor", self.semantic_decay_factor))
-        self.semantic_min_confidence = float(config.get("semantic_min_confidence", 0.35))
-        self.semantic_ema_alpha = float(config.get("semantic_ema_alpha", 1.0))
-        self.semantic_switch_margin = float(config.get("semantic_switch_margin", 0.05))
-        self.semantic_switch_support_frames = int(config.get("semantic_switch_support_frames", 3))
-        self.semantic_switch_cooldown_frames = int(config.get("semantic_switch_cooldown_frames", 2))
-        self.semantic_assign_min_confidence = float(
-            config.get("semantic_assignment_min_confidence", config.get("yolo_min_confidence", 0.4))
-        )
-        self.instance_min_points = int(config.get("instance_min_points", 30))
-        self.instance_iou_gate = float(config.get("instance_iou_gate", 0.15))
-        self.instance_center_gate_m = float(config.get("instance_center_gate_m", 0.30))
-        self.instance_overlap_gate = float(config.get("instance_overlap_gate", 0.12))
-        self.instance_partial_overlap_gate = float(config.get("instance_partial_overlap_gate", 0.08))
-        self.instance_bbox_expand_ratio = float(config.get("instance_bbox_expand_ratio", 0.2))
-        self.instance_merge_min_ratio = float(config.get("instance_merge_min_ratio", 0.2))
-        self.instance_max_missed_frames = int(config.get("instance_max_missed_frames", 30))
-        self.instance_bbox_quantile = float(config.get("instance_bbox_quantile", 0.03))
-        self.instance_bbox_merge_iou = float(config.get("instance_bbox_merge_iou", 0.25))
-        self.instance_bbox_merge_center_gate_m = float(config.get("instance_bbox_merge_center_gate_m", 0.25))
+        seg = config.segmentation
+        self.semantic_decay_factor = float(seg.decay_factor)
+        self.semantic_challenger_decay_factor = float(seg.challenger_decay_factor)
+        self.semantic_min_confidence = float(seg.min_semantic_confidence)
+        self.semantic_ema_alpha = float(seg.ema_alpha)
+        self.semantic_switch_margin = float(seg.switch_margin)
+        self.semantic_switch_support_frames = int(seg.switch_support_frames)
+        self.semantic_switch_cooldown_frames = int(seg.switch_cooldown_frames)
+        self.semantic_assign_min_confidence = float(seg.assignment_min_confidence)
+
+        inst = config.instance
+        self.instance_min_points = int(inst.min_points)
+        self.instance_iou_gate = float(inst.iou_gate)
+        self.instance_center_gate_m = float(inst.center_gate_m)
+        self.instance_overlap_gate = float(inst.overlap_gate)
+        self.instance_partial_overlap_gate = float(inst.partial_overlap_gate)
+        self.instance_bbox_expand_ratio = float(inst.bbox_expand_ratio)
+        self.instance_merge_min_ratio = float(inst.merge_min_ratio)
+        self.instance_max_missed_frames = int(inst.max_missed_frames)
+        self.instance_bbox_quantile = float(inst.bbox_quantile)
+        self.instance_bbox_merge_iou = float(inst.bbox_merge_iou)
+        self.instance_bbox_merge_center_gate_m = float(inst.bbox_merge_center_gate_m)
         self._instance_next_id = 1
         self._instance_frame_idx = 0
         self._instance_track_meta: dict[int, dict] = {}
@@ -100,10 +100,10 @@ class PointCloud:
         self.scene_graph_last_error = ""
 
         # Voxel Packing
-        self._pack_offset = int(config.get("pack_offset", 1_000_000))
+        self._pack_offset = int(gs.pack_offset)
         self._pack_base = 2 * self._pack_offset + 1
         self.seen_keys = torch.empty((0,), dtype=torch.int64, device=self.device)
-        self.pixel_subsample = float(config.get("pixel_subsample", 1.0))
+        self.pixel_subsample = float(gs.pixel_subsample)
 
         # Rotation Fix
         ax, ay = np.radians(-90), np.radians(180)

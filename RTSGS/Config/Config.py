@@ -1,137 +1,125 @@
+from __future__ import annotations
+
+from pathlib import Path
+
 import numpy as np
+from omegaconf import OmegaConf, DictConfig
+
+
+_CONFIGS_DIR = Path(__file__).resolve().parent.parent.parent / "configs"
+
+
+def load_config(path: str, overrides: dict | None = None) -> "Config":
+    base_cfg = OmegaConf.load(_CONFIGS_DIR / "base.yaml")
+
+    config_path = Path(path)
+    if not config_path.is_absolute():
+        config_path = Path.cwd() / config_path
+
+    overlay_cfg = OmegaConf.load(config_path)
+    overlay_cfg.pop("defaults", None)
+    cfg = OmegaConf.merge(base_cfg, overlay_cfg)
+
+    if overrides:
+        cfg = OmegaConf.merge(cfg, OmegaConf.create(overrides))
+
+    OmegaConf.resolve(cfg)
+    return Config(cfg)
+
 
 class Config:
-    def __init__(self, config_dict=None):
-        if( config_dict is not None):
-            self.config_dict = config_dict
-        else:
-            self.config_dict = {}
-            # Default to TUM-like intrinsics for both rgb and depth cameras.
-            self.config_dict.setdefault('rgb_fx', 525.0)
-            self.config_dict.setdefault('rgb_fy', 525.0)
-            self.config_dict.setdefault('rgb_cx', 319.5)
-            self.config_dict.setdefault('rgb_cy', 239.5)
-            self.config_dict.setdefault('rgb_width', 640)
-            self.config_dict.setdefault('rgb_height', 480)
+    def __init__(self, cfg: DictConfig):
+        self._cfg = cfg
 
-            self.config_dict.setdefault('depth_fx', 525.0)
-            self.config_dict.setdefault('depth_fy', 525.0)
-            self.config_dict.setdefault('depth_cx', 319.5)
-            self.config_dict.setdefault('depth_cy', 239.5)
-            self.config_dict.setdefault('depth_width', 640)
-            self.config_dict.setdefault('depth_height', 480)
+    # ── Structured access ─────────────────────────────────────────────────
+    @property
+    def camera(self) -> DictConfig:
+        return self._cfg.camera
 
-            self.config_dict.setdefault('T_depth_to_rgb', np.eye(4, dtype=np.float32).tolist())
-            self.config_dict.setdefault('depth_scale', 5000.0)
-            self.config_dict.setdefault('voxel_size', 0.05)
-            self.config_dict.setdefault('kf_translation',0.02)
-            self.config_dict.setdefault('kf_rotation',5.0 * np.pi / 180.0)
-            
-            self.config_dict.setdefault("sigma_px", 4.0)
-            self.config_dict.setdefault("sigma_z0", 0.005)
-            self.config_dict.setdefault("sigma_z1", 0.0)
-            self.config_dict.setdefault("alpha_init", 1.0)
-            self.config_dict.setdefault("alpha_min", 0.01)
-            self.config_dict.setdefault("alpha_max", 1.0)
-            self.config_dict.setdefault("alpha_depth_scale", 0.0)
-            self.config_dict.setdefault("gs_points_lr_mult", 0.3)
-            self.config_dict.setdefault("gs_depth_loss_weight", 0.1)
-            self.config_dict.setdefault("gs_depth_huber_delta", 0.05)
-            self.config_dict.setdefault("use_rendered_depth_icp", True)
+    @property
+    def gaussian_splatting(self) -> DictConfig:
+        return self._cfg.gaussian_splatting
 
-            # Keyframe-to-keyframe tracking gate.
-            self.config_dict.setdefault("kf_depth_change_threshold_m", 0.03)
-            self.config_dict.setdefault("kf_photometric_change_threshold", 0.08)
-            self.config_dict.setdefault("kf_depth_min_coverage", 0.10)
-            self.config_dict.setdefault("kf_min_frame_gap", 1)
-            self.config_dict.setdefault("kf_max_frame_gap", 30)
-            self.config_dict.setdefault("kf_require_both_signals", True)
+    @property
+    def tracker(self) -> DictConfig:
+        return self._cfg.tracker
 
-            # Per-frame Mask2Former panoptic semantic fusion.
-            self.config_dict.setdefault("yolo_segmentation_enabled", True)
-            self.config_dict.setdefault("mask2former_model_id", "facebook/mask2former-swin-large-ade-panoptic")
-            self.config_dict.setdefault("yolo_model_path", "facebook/mask2former-swin-large-ade-panoptic")
-            self.config_dict.setdefault("yolo_min_confidence", 0.25)
-            self.config_dict.setdefault("semantic_assignment_min_confidence", 0.4)
-            self.config_dict.setdefault("yolo_max_detections", 64)
-            self.config_dict.setdefault("semantic_decay_factor", 0.98)
-            self.config_dict.setdefault("semantic_challenger_decay_factor", 0.98)
-            self.config_dict.setdefault("semantic_min_confidence", 0.2)
-            self.config_dict.setdefault("semantic_ema_alpha", 1.0)
-            self.config_dict.setdefault("semantic_switch_margin", 0.08)
-            self.config_dict.setdefault("semantic_switch_support_frames", 3)
-            self.config_dict.setdefault("semantic_switch_cooldown_frames", 2)
-            self.config_dict.setdefault("semantic_depth_tolerance_m", 0.08)
-            self.config_dict.setdefault("semantic_cull_near", 0.05)
-            self.config_dict.setdefault("semantic_cull_far", 50.0)
-            self.config_dict.setdefault("semantic_cull_pad_px", 2.0)
-            self.config_dict.setdefault("instance_overlap_gate", 0.12)
-            self.config_dict.setdefault("instance_partial_overlap_gate", 0.08)
-            self.config_dict.setdefault("instance_bbox_merge_iou", 0.05)
-            self.config_dict.setdefault("instance_bbox_expand_ratio", 0.2)
-            self.config_dict.setdefault("instance_merge_min_ratio", 0.2)
+    @property
+    def segmentation(self) -> DictConfig:
+        return self._cfg.segmentation
 
-            # Semantic segmentation stride (run Mask2Former every N keyframes).
-            self.config_dict.setdefault("semantic_update_stride", 10)
+    @property
+    def instance(self) -> DictConfig:
+        return self._cfg.instance
 
-            # Real-time scene graph: Mask2Former -> RelationHead -> global MP-GNN.
-            self.config_dict.setdefault("scenegraph_enabled", True)
-            self.config_dict.setdefault("scenegraph_max_objects_per_keyframe", 0)
-            self.config_dict.setdefault("scenegraph_update_stride", 10)
-            self.config_dict.setdefault("scenegraph_max_nodes", 48)
-            self.config_dict.setdefault("scenegraph_max_relations", 256)
-            self.config_dict.setdefault("scenegraph_rel_threshold", 0.5)
-            self.config_dict.setdefault("scenegraph_relation_persist", True)
-            self.config_dict.setdefault("scenegraph_relation_ttl", 10)
-            self.config_dict.setdefault("scenegraph_instance_ttl", 30)
-            self.config_dict.setdefault("scenegraph_instance_merge_dist", 0.6)
-            self.config_dict.setdefault(
-                "scenegraph_relation_head_checkpoint",
-                "Datasets/3RScan/3RScan/data/scans/relation_branch_hard_negative_bce.pt",
-            )
-            self.config_dict.setdefault("scenegraph_relationships_path", "Datasets/3DSSG/3DSSG/relationships.txt")
-            self.config_dict.setdefault("scenegraph_min_mask_pixels", 200)
+    @property
+    def scenegraph(self) -> DictConfig:
+        return self._cfg.scenegraph
 
-    def get_rgb_intrinsics(self):
+    # ── Intrinsics helpers ────────────────────────────────────────────────
+    def get_rgb_intrinsics(self) -> np.ndarray:
+        c = self._cfg.camera.rgb
         return np.array(
-            [[self.config_dict['rgb_fx'], 0, self.config_dict['rgb_cx']],
-             [0, self.config_dict['rgb_fy'], self.config_dict['rgb_cy']],
+            [[c.fx, 0, c.cx],
+             [0, c.fy, c.cy],
              [0, 0, 1]],
             dtype=np.float32,
         )
 
-    def get_depth_intrinsics(self):
+    def get_depth_intrinsics(self) -> np.ndarray:
+        c = self._cfg.camera.depth
         return np.array(
-            [[self.config_dict['depth_fx'], 0, self.config_dict['depth_cx']],
-             [0, self.config_dict['depth_fy'], self.config_dict['depth_cy']],
+            [[c.fx, 0, c.cx],
+             [0, c.fy, c.cy],
              [0, 0, 1]],
             dtype=np.float32,
         )
 
-    def get_rgb_size(self):
-        return int(self.config_dict['rgb_width']), int(self.config_dict['rgb_height'])
+    def get_rgb_size(self) -> tuple[int, int]:
+        c = self._cfg.camera.rgb
+        return int(c.width), int(c.height)
 
-    def get_depth_size(self):
-        return int(self.config_dict['depth_width']), int(self.config_dict['depth_height'])
+    def get_depth_size(self) -> tuple[int, int]:
+        c = self._cfg.camera.depth
+        return int(c.width), int(c.height)
 
-    def get_T_depth_to_rgb(self):
-        T = np.asarray(self.config_dict.get('T_depth_to_rgb', np.eye(4, dtype=np.float32)), dtype=np.float32)
+    def get_T_depth_to_rgb(self) -> np.ndarray:
+        raw = self._cfg.camera.T_depth_to_rgb
+        if raw is None:
+            return np.eye(4, dtype=np.float32)
+        T = np.asarray(raw, dtype=np.float32)
         if T.shape != (4, 4):
             return np.eye(4, dtype=np.float32)
         return T
 
-    def get_T_rgb_to_depth(self):
+    def get_T_rgb_to_depth(self) -> np.ndarray:
         T_d2r = self.get_T_depth_to_rgb()
         try:
             return np.linalg.inv(T_d2r).astype(np.float32)
         except np.linalg.LinAlgError:
             return np.eye(4, dtype=np.float32)
 
-    def get(self, key, default=None):
-        return self.config_dict.get(key, default)
+    # ── Runtime mutation (used by ScanNet loader to override per-scene intrinsics) ─
+    _FLAT_KEY_MAP = {
+        "rgb_fx": "camera.rgb.fx",
+        "rgb_fy": "camera.rgb.fy",
+        "rgb_cx": "camera.rgb.cx",
+        "rgb_cy": "camera.rgb.cy",
+        "rgb_width": "camera.rgb.width",
+        "rgb_height": "camera.rgb.height",
+        "depth_fx": "camera.depth.fx",
+        "depth_fy": "camera.depth.fy",
+        "depth_cx": "camera.depth.cx",
+        "depth_cy": "camera.depth.cy",
+        "depth_width": "camera.depth.width",
+        "depth_height": "camera.depth.height",
+        "depth_scale": "camera.depth_scale",
+        "T_depth_to_rgb": "camera.T_depth_to_rgb",
+    }
 
-    def set(self, key, value):
-        self.config_dict[key] = value
+    def set(self, key: str, value) -> None:
+        path = self._FLAT_KEY_MAP.get(key, key)
+        OmegaConf.update(self._cfg, path, value)
 
-    def to_dict(self):
-        return self.config_dict
+    def to_dict(self) -> dict:
+        return OmegaConf.to_container(self._cfg, resolve=True)

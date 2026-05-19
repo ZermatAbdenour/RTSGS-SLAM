@@ -1,0 +1,35 @@
+defaults:
+  - base
+
+camera:
+  rgb:
+    fx: 600.0
+    fy: 600.0
+    cx: 599.5
+    cy: 339.5
+    width: 1200
+    height: 680
+  depth:
+    fx: 600.0
+    fy: 600.0
+    cx: 599.5
+    cy: 339.5
+    width: 1200
+    height: 680
+  depth_scale: 6553.5
+
+gaussian_splatting:
+  voxel_size: 0.03
+  sigma_px: 4.0
+  sigma_z0: 0.003
+  sigma_z1: 0.0
+  alpha_init: 1.0
+  alpha_min: 0.01
+  alpha_max: 1.0
+  alpha_depth_scale: 0.0
+  points_lr_mult: 0.3
+  depth_loss_weight: 0.1
+  depth_huber_delta: 0.05
+
+tracker:
+  use_rendered_depth_icp: true

@@ -1,0 +1,37 @@
+defaults:
+  - base
+
+camera:
+  rgb:
+    fx: 1169.621094
+    fy: 1167.105103
+    cx: 646.295044
+    cy: 489.927032
+    width: 1296
+    height: 968
+  depth:
+    fx: 577.590698
+    fy: 578.729797
+    cx: 318.905426
+    cy: 242.683609
+    width: 640
+    height: 480
+  depth_scale: 1000.0
+
+gaussian_splatting:
+  voxel_size: 0.02
+  sigma_px: 2.0
+  sigma_z0: 0.003
+  sigma_z1: 0.0
+  alpha_init: 1.0
+  alpha_min: 0.01
+  alpha_max: 1.0
+  alpha_depth_scale: 0.0
+  points_lr_mult: 0.3
+  depth_loss_weight: 0.1
+  depth_huber_delta: 0.05
+
+tracker:
+  kf_translation: 0.1
+  kf_rotation: 0.6108652   # 35 * pi / 180
+  use_rendered_depth_icp: true

@@ -69,31 +69,23 @@ class RealtimeSceneGraphRuntime:
         self.config = config
         self.project_root = project_root
 
-        self.enabled = bool(config.get("scenegraph_enabled", True))
+        sg = config.scenegraph
+        self.enabled = bool(sg.enabled)
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-        self.max_objects_per_keyframe = int(config.get("scenegraph_max_objects_per_keyframe", 12))
-        self.update_stride = max(1, int(config.get("scenegraph_update_stride", 1)))
+        self.max_objects_per_keyframe = int(sg.max_objects_per_keyframe)
+        self.update_stride = max(1, int(sg.update_stride))
         self._last_published_kf = -1
-        self.max_nodes = int(config.get("scenegraph_max_nodes", 48))
-        self.max_relations = int(config.get("scenegraph_max_relations", 0))
-        self.rel_threshold = float(config.get("scenegraph_rel_threshold", 0.2))
-        self.instance_ttl = int(config.get("scenegraph_instance_ttl", 30))
-        self.instance_merge_dist = float(config.get("scenegraph_instance_merge_dist", 0.6))
-        self.ema_momentum = float(config.get("scenegraph_ema_momentum", 0.3))
-        self.relation_decay = float(config.get("scenegraph_relation_decay", 0.95))
+        self.max_nodes = int(sg.max_nodes)
+        self.max_relations = int(sg.max_relations)
+        self.rel_threshold = float(sg.rel_threshold)
+        self.instance_ttl = int(sg.instance_ttl)
+        self.instance_merge_dist = float(sg.instance_merge_dist)
+        self.ema_momentum = float(sg.ema_momentum)
+        self.relation_decay = float(sg.relation_decay)
 
-        self.relation_head_ckpt = self._abs_path(
-            str(
-                config.get(
-                    "scenegraph_relation_head_checkpoint",
-                    "Datasets/3RScan/3RScan/data/scans/relation_branch_hard_negative_bce.pt",
-                )
-            )
-        )
-        self.relationships_path = self._abs_path(
-            str(config.get("scenegraph_relationships_path", "Datasets/3DSSG/3DSSG/relationships.txt"))
-        )
+        self.relation_head_ckpt = self._abs_path(str(sg.relation_head_checkpoint))
+        self.relationships_path = self._abs_path(str(sg.relationships_path))
 
         self._relation_head = None
         self._obj_proj = None

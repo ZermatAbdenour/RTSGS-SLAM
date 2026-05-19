@@ -73,10 +73,7 @@ class RTSGSSystem:
         self.last_added_keyframe_idx = -1
 
         # Throttle semantic segmentation: run once every N keyframes.
-        self.semantic_update_stride = max(
-            1,
-            int(config.get("semantic_update_stride", config.get("scenegraph_update_stride", 1))),
-        )
+        self.semantic_update_stride = max(1, int(config.segmentation.update_stride))
         self._last_enqueued_semantic_kf = -1
 
         # Benchmarking (enabled only when run(benchmark=True))

@@ -117,9 +117,10 @@ class GaussianSplatting:
         self.iteration_count = 0
 
         # Loss and optimization knobs
-        self.points_lr_mult = float(self.tracker.config.get('gs_points_lr_mult', 0.3))
-        self.depth_loss_weight = float(self.tracker.config.get('gs_depth_loss_weight', 0.1))
-        self.depth_huber_delta = float(self.tracker.config.get('gs_depth_huber_delta', 0.05))
+        gs = self.tracker.config.gaussian_splatting
+        self.points_lr_mult = float(gs.points_lr_mult)
+        self.depth_loss_weight = float(gs.depth_loss_weight)
+        self.depth_huber_delta = float(gs.depth_huber_delta)
 
         # Token-bucket limiter: smooth "max_steps_per_sec"
         self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=100.0)

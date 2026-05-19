@@ -26,18 +26,15 @@ class ICPORBTracker(Tracker):
         self.cx, self.cy = float(K_depth[0, 2]), float(K_depth[1, 2])
         self.K = K_depth
 
-        self.depth_scale = config.get("depth_scale")
+        self.depth_scale = config.camera.depth_scale
         self.orb = cv2.ORB_create(nfeatures=Orb_features)
 
-        # BF matcher for ratio test KNN
         self._bf_knn = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
 
-        # Global poses history (same initial pose as your SimpleORBTracker)
         self.poses = [dataset.gt_poses[0]]
 
-        # keyframe thresholds
-        self.alpha = config.get("kf_translation", 0.05)
-        self.theta = config.get("kf_rotation", 5.0 * np.pi / 180.0)
+        self.alpha = config.tracker.kf_translation
+        self.theta = config.tracker.kf_rotation
 
         self.last_kf_pose = None
 
@@ -53,7 +50,7 @@ class ICPORBTracker(Tracker):
         self.show_comparison_window = False
 
         # PyTorch device
-        cuda_index = int(config.get("cuda_device", 0))
+        cuda_index = int(config.tracker.cuda_device)
         if torch.cuda.is_available():
             self.device = torch.device(f"cuda:{cuda_index}")
         else:

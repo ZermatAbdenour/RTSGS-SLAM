@@ -1,0 +1,29 @@
+defaults:
+  - base
+
+camera:
+  rgb:
+    fx: 320.0
+    fy: 320.0
+    cx: 319.5
+    cy: 239.5
+    width: 640
+    height: 480
+  depth:
+    fx: 320.0
+    fy: 320.0
+    cx: 319.5
+    cy: 239.5
+    width: 640
+    height: 480
+  depth_scale: 1000.0
+
+gaussian_splatting:
+  voxel_size: 0.02
+  sigma_px: 2.0
+  sigma_z0: 0.001
+  sigma_z1: 0.0
+  alpha_init: 1.0
+  alpha_min: 0.01
+  alpha_max: 1.0
+  alpha_depth_scale: 0.0

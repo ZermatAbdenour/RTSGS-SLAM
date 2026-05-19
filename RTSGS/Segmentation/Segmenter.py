@@ -14,25 +14,25 @@ class YOLOSemanticSegmenter:
         self.config = config
         self.project_root = project_root
 
-        self.enabled = bool(config.get("yolo_segmentation_enabled", True))
-        self.model_id = str(
-            config.get("mask2former_model_id", config.get("yolo_model_path", "facebook/mask2former-swin-base-coco-panoptic"))
-        )
-        self.min_confidence = float(config.get("yolo_min_confidence", 0.6))
-        self.assignment_confidence_gate = float(config.get("semantic_assignment_min_confidence", 0.4))
-        self.max_detections = int(config.get("yolo_max_detections", 64))
-        self.semantic_depth_tolerance_m = float(config.get("semantic_depth_tolerance_m", 0.04))
-        self.semantic_mask_threshold = float(config.get("semantic_mask_threshold", 0.5))
-        self.semantic_mask_erode_px = int(config.get("semantic_mask_erode_px", 10))
-        self.semantic_mask_pad_px = int(config.get("semantic_mask_pad_px", 0))
-        self.semantic_depth_edge_reject_enabled = bool(config.get("semantic_depth_edge_reject_enabled", True))
-        self.semantic_depth_edge_threshold_m = float(config.get("semantic_depth_edge_threshold_m", 0.05))
-        self.cull_near = float(config.get("semantic_cull_near", 0.05))
-        self.cull_far = float(config.get("semantic_cull_far", 50.0))
-        self.cull_pad_px = float(config.get("semantic_cull_pad_px", 2.0))
-        self.scenegraph_enabled = bool(config.get("scenegraph_enabled", True))
-        self.scenegraph_max_objects_per_keyframe = int(config.get("scenegraph_max_objects_per_keyframe", 12))
-        self.scenegraph_min_mask_pixels = int(config.get("scenegraph_min_mask_pixels", 200))
+        seg = config.segmentation
+        self.enabled = bool(seg.enabled)
+        self.model_id = str(seg.model_id)
+        self.min_confidence = float(seg.min_confidence)
+        self.assignment_confidence_gate = float(seg.assignment_min_confidence)
+        self.max_detections = int(seg.max_detections)
+        self.semantic_depth_tolerance_m = float(seg.depth_tolerance_m)
+        self.semantic_mask_threshold = float(seg.mask_threshold)
+        self.semantic_mask_erode_px = int(seg.mask_erode_px)
+        self.semantic_mask_pad_px = int(seg.mask_pad_px)
+        self.semantic_depth_edge_reject_enabled = bool(seg.depth_edge_reject_enabled)
+        self.semantic_depth_edge_threshold_m = float(seg.depth_edge_threshold_m)
+        self.cull_near = float(seg.cull_near)
+        self.cull_far = float(seg.cull_far)
+        self.cull_pad_px = float(seg.cull_pad_px)
+        sg = config.scenegraph
+        self.scenegraph_enabled = bool(sg.enabled)
+        self.scenegraph_max_objects_per_keyframe = int(sg.max_objects_per_keyframe)
+        self.scenegraph_min_mask_pixels = int(sg.min_mask_pixels)
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.device_str = "cuda:0" if self.device.type == "cuda" else "cpu"

@@ -1,13 +1,12 @@
 from abc import ABC, abstractmethod
 
-from RTSGS.Config.Config import Config
 from RTSGS.DataLoader.DataLoader import DataLoader
 
 class Tracker(ABC):
     @abstractmethod
-    def __init__(self,dataset:DataLoader,config:Config):
+    def __init__(self, dataset: DataLoader, config):
         self.poses = []
-        self.keyframes_poses=[]
+        self.keyframes_poses = []
         self.keyframe_frame_indices = []
         self.keyframes_covis_masks = []
         self.config = config
