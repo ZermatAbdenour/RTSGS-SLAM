@@ -1,6 +1,5 @@
 import os
 import time
-from collections import defaultdict
 from typing import Dict, List, Optional, Tuple
 
 import torch
@@ -64,73 +63,6 @@ class RelationHead(nn.Module):
         return self.rel_predictor(edges.view(bsz, k, k, -1))
 
 
-class GlobalSceneGraphMPNN(nn.Module):
-    def __init__(self, node_dim: int, rel_dim: int, hidden_dim: int = 512, num_layers: int = 3, dropout: float = 0.1):
-        super().__init__()
-
-        self.node_proj = nn.Linear(node_dim, hidden_dim)
-        self.edge_proj = nn.Linear(rel_dim, hidden_dim)
-
-        self.message_mlp = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, hidden_dim),
-        )
-
-        self.temporal_gru = nn.GRUCell(hidden_dim, hidden_dim)
-        self.node_update = nn.GRUCell(hidden_dim, hidden_dim)
-
-        self.edge_out = nn.Sequential(
-            nn.Linear(hidden_dim * 3, hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(dropout),
-            nn.Linear(hidden_dim, rel_dim),
-        )
-
-        self.num_layers = int(num_layers)
-        self.hidden_dim = int(hidden_dim)
-
-    def forward(
-        self,
-        node_feats: torch.Tensor,
-        edge_feats: torch.Tensor,
-        prev_state: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        node_feats: [N, D]
-        edge_feats: [N, N, R] initial global relation logits from RelationHead
-        prev_state: [N, H] optional temporal hidden state
-        returns:
-            logits: [N, N, R] refined global relation logits
-            state:  [N, H] updated temporal hidden state
-        """
-        h = self.node_proj(node_feats)  # [N, H]
-        e = self.edge_proj(edge_feats)  # [N, N, H]
-
-        if prev_state is not None:
-            h = self.temporal_gru(h, prev_state)
-
-        n, h_dim = h.shape
-        if n == 0:
-            raise RuntimeError("Cannot run MPNN on empty graph.")
-
-        for _ in range(self.num_layers):
-            hi = h.unsqueeze(1).expand(n, n, h_dim)
-            hj = h.unsqueeze(0).expand(n, n, h_dim)
-
-            msg_input = torch.cat([hi, hj, e], dim=-1)
-            messages = self.message_mlp(msg_input)
-
-            incoming = messages.sum(dim=0) / max(n, 1)
-            h = self.node_update(incoming, h)
-
-        hi = h.unsqueeze(1).expand(n, n, h_dim)
-        hj = h.unsqueeze(0).expand(n, n, h_dim)
-        edge_input = torch.cat([hi, hj, e], dim=-1)
-        return self.edge_out(edge_input), h
-
-
 class RealtimeSceneGraphRuntime:
     def __init__(self, pcd, config, project_root: str):
         self.pcd = pcd
@@ -144,11 +76,12 @@ class RealtimeSceneGraphRuntime:
         self.update_stride = max(1, int(config.get("scenegraph_update_stride", 1)))
         self._last_published_kf = -1
         self.max_nodes = int(config.get("scenegraph_max_nodes", 48))
-        # Keep all relations above the fixed threshold (RelationHead only, no MP-GNN).
         self.max_relations = int(config.get("scenegraph_max_relations", 0))
-        self.rel_threshold = float(config.get("scenegraph_rel_threshold", 0.5))
+        self.rel_threshold = float(config.get("scenegraph_rel_threshold", 0.2))
         self.instance_ttl = int(config.get("scenegraph_instance_ttl", 30))
         self.instance_merge_dist = float(config.get("scenegraph_instance_merge_dist", 0.6))
+        self.ema_momentum = float(config.get("scenegraph_ema_momentum", 0.3))
+        self.relation_decay = float(config.get("scenegraph_relation_decay", 0.95))
 
         self.relation_head_ckpt = self._abs_path(
             str(
@@ -161,28 +94,16 @@ class RealtimeSceneGraphRuntime:
         self.relationships_path = self._abs_path(
             str(config.get("scenegraph_relationships_path", "Datasets/3DSSG/3DSSG/relationships.txt"))
         )
-        self.mpgnn_ckpt = self._abs_path(
-            str(
-                config.get(
-                    "scenegraph_mpgnn_checkpoint",
-                    "Datasets/3RScan/3RScan/data/scans/global_scene_graph_mpgnn.pt",
-                )
-            )
-        )
 
         self._relation_head = None
         self._obj_proj = None
         self._hidden_dim = None
         self._rel_dim = None
-        self._mpgnn = None
-        self._mpgnn_cfg = {}
-        self._temporal_state_by_objid: Dict[int, torch.Tensor] = {}
 
         self.relationship_names: List[str] = []
         self.instance_state: Dict[int, Dict[str, torch.Tensor]] = {}
-        self.relation_cache: Dict[Tuple[int, int, int], Dict[str, object]] = {}
-        self.edge_sum: Dict[Tuple[int, int], torch.Tensor] = {}
-        self.edge_count: Dict[Tuple[int, int], int] = defaultdict(int)
+        self.edge_ema: Dict[Tuple[int, int], torch.Tensor] = {}
+        self.relation_memory: Dict[Tuple[int, int, int], Dict] = {}
         self.version = 0
 
         self._ready = False
@@ -243,56 +164,15 @@ class RealtimeSceneGraphRuntime:
         self._rel_dim = num_rel_classes
         return True
 
-    def _load_mpgnn(self) -> bool:
-        if self._mpgnn is not None:
-            return True
-        if not os.path.exists(self.mpgnn_ckpt):
-            return False
-
-        ckpt = torch.load(self.mpgnn_ckpt, map_location=self.device)
-        state = ckpt.get("mpgnn_state_dict", {})
-        cfg = ckpt.get("config", {}) if isinstance(ckpt.get("config", {}), dict) else {}
-
-        node_dim = int(cfg.get("node_dim", self._hidden_dim or 512))
-        rel_dim = int(cfg.get("rel_dim", self._rel_dim or 41))
-        hidden_dim = int(cfg.get("mpgnn_hidden_dim", 512))
-        num_layers = int(cfg.get("mpgnn_num_layers", 3))
-
-        model = GlobalSceneGraphMPNN(
-            node_dim=node_dim,
-            rel_dim=rel_dim,
-            hidden_dim=hidden_dim,
-            num_layers=num_layers,
-            dropout=0.1,
-        ).to(self.device)
-        if state:
-            model.load_state_dict(state, strict=True)
-        model.eval()
-
-        self._mpgnn = model
-        self._mpgnn_cfg = dict(cfg)
-        if self._hidden_dim is None:
-            self._hidden_dim = node_dim
-        if self._rel_dim is None:
-            self._rel_dim = rel_dim
-        return True
-
     def start(self):
         if not self.enabled:
             return
         ok = self._load_relation_head()
-        if ok:
-            self._load_mpgnn()
         self._ready = bool(ok)
         if self._ready:
             if not self.relationship_names:
                 self.relationship_names = self._read_relationship_names()
-            if not self.relationship_names and isinstance(self._mpgnn_cfg.get("relation_names"), list):
-                self.relationship_names = [str(x) for x in self._mpgnn_cfg.get("relation_names", []) if str(x)]
-            if self._mpgnn is None:
-                print("[SceneGraph] Runtime initialized (RelationHead only).")
-            else:
-                print("[SceneGraph] Runtime initialized (RelationHead + MP-GNN).")
+            print("[SceneGraph] Runtime initialized (cumulative relation graph).")
         else:
             self.enabled = False
             print("[SceneGraph] Disabled due to initialization error.")
@@ -332,32 +212,17 @@ class RealtimeSceneGraphRuntime:
             self.instance_state.pop(iid, None)
         if stale_ids:
             stale_set = set(int(x) for x in stale_ids)
-            if self.relation_cache:
-                self.relation_cache = {
+            if self.edge_ema:
+                self.edge_ema = {
                     key: value
-                    for key, value in self.relation_cache.items()
+                    for key, value in self.edge_ema.items()
                     if key[0] not in stale_set and key[1] not in stale_set
                 }
-            if self.edge_sum:
-                self.edge_sum = {
+            if self.relation_memory:
+                self.relation_memory = {
                     key: value
-                    for key, value in self.edge_sum.items()
+                    for key, value in self.relation_memory.items()
                     if key[0] not in stale_set and key[1] not in stale_set
-                }
-            if self.edge_count:
-                self.edge_count = defaultdict(
-                    int,
-                    {
-                        key: value
-                        for key, value in self.edge_count.items()
-                        if key[0] not in stale_set and key[1] not in stale_set
-                    },
-                )
-            if self._temporal_state_by_objid:
-                self._temporal_state_by_objid = {
-                    key: value
-                    for key, value in self._temporal_state_by_objid.items()
-                    if key not in stale_set
                 }
 
     def _merge_instance_id(self, inst_id: int, _class_id: int, _center: torch.Tensor) -> int:
@@ -554,53 +419,35 @@ class RealtimeSceneGraphRuntime:
                 k = int(frame_probs.shape[0])
                 debug["frame_pairs"] = int(k * (k - 1))
 
-                if self._mpgnn is not None:
-                    for i in range(k):
-                        src_id = int(frame_inst_ids[i])
-                        for j in range(k):
-                            if i == j:
-                                continue
-                            dst_id = int(frame_inst_ids[j])
-                            key = (src_id, dst_id)
-                            value = frame_logits[i, j]
-                            if key not in self.edge_sum:
-                                self.edge_sum[key] = value.detach().clone()
+                alpha_up = self.ema_momentum
+                alpha_down = alpha_up * 0.1
+                rel_thresh = float(self.rel_threshold)
+                for i in range(k):
+                    src_id = int(frame_inst_ids[i])
+                    for j in range(k):
+                        if i == j:
+                            continue
+                        dst_id = int(frame_inst_ids[j])
+                        key = (src_id, dst_id)
+                        logits = frame_logits[i, j].detach()
+                        if key not in self.edge_ema:
+                            self.edge_ema[key] = logits.clone()
+                        else:
+                            prev = self.edge_ema[key]
+                            alpha = torch.where(logits > prev, alpha_up, alpha_down)
+                            self.edge_ema[key] = alpha * logits + (1.0 - alpha) * prev
+
+                        probs = torch.sigmoid(logits)
+                        above = torch.where(probs >= rel_thresh)[0]
+                        for r_i_t in above:
+                            r_i = int(r_i_t.item())
+                            score = float(probs[r_i].item())
+                            mem_key = (src_id, dst_id, r_i)
+                            existing = self.relation_memory.get(mem_key)
+                            if existing is None or score > float(existing["score"]):
+                                self.relation_memory[mem_key] = {"score": score, "last_seen_kf": kf_i}
                             else:
-                                self.edge_sum[key] = self.edge_sum[key] + value.detach()
-                            self.edge_count[key] += 1
-                else:
-                    rel_thresh = float(self.rel_threshold)
-                    for i in range(k):
-                        src_id = int(frame_inst_ids[i])
-                        for j in range(k):
-                            if i == j:
-                                continue
-                            dst_id = int(frame_inst_ids[j])
-                            active_rel = torch.where(frame_probs[i, j] >= rel_thresh)[0]
-                            for r_i_t in active_rel:
-                                r_i = int(r_i_t.item())
-                                score = float(frame_probs[i, j, r_i].item())
-                                rel_name = (
-                                    self.relationship_names[r_i]
-                                    if r_i < len(self.relationship_names)
-                                    else f"rel_{r_i}"
-                                )
-                                key = (src_id, dst_id, r_i)
-                                entry = self.relation_cache.get(key)
-                                if entry is None or float(entry.get("score", 0.0)) < score:
-                                    self.relation_cache[key] = {
-                                        "score": score,
-                                        "predicate": rel_name,
-                                        "last_seen_kf": kf_i,
-                                    }
-                                else:
-                                    entry["last_seen_kf"] = kf_i
-
-                                debug["relations_raw"] += 1
-                                if score > debug["max_relation_score"]:
-                                    debug["max_relation_score"] = score
-
-                    debug["max_relation_prob"] = debug["max_relation_score"]
+                                existing["last_seen_kf"] = kf_i
 
             if not publish_state:
                 return
@@ -645,93 +492,70 @@ class RealtimeSceneGraphRuntime:
                     }
                 )
 
-            if self._mpgnn is not None and len(node_feats) >= 2:
-                node_feats_t = torch.stack(node_feats, dim=0)
-                n = int(node_feats_t.shape[0])
-                rel_dim = int(self._rel_dim or 0)
-                edge_feats = torch.zeros(n, n, rel_dim, dtype=torch.float32, device=self.device)
+            rel_thresh = float(self.rel_threshold)
+            decay = self.relation_decay
+            seen_triplets: set = set()
 
-                for (src_id, dst_id), value in self.edge_sum.items():
-                    if src_id not in obj_to_idx or dst_id not in obj_to_idx:
+            for (src_id, dst_id), ema_logits in self.edge_ema.items():
+                if src_id not in obj_to_idx or dst_id not in obj_to_idx:
+                    continue
+                ema_probs = torch.sigmoid(ema_logits)
+                for r_i in range(ema_probs.shape[0]):
+                    ema_score = float(ema_probs[r_i].item())
+                    mem = self.relation_memory.get((src_id, dst_id, r_i))
+                    if mem is not None:
+                        age = max(0, kf_i - int(mem["last_seen_kf"]))
+                        decayed = float(mem["score"]) * (decay ** age)
+                    else:
+                        decayed = 0.0
+                    score = max(ema_score, decayed)
+                    if score < rel_thresh:
                         continue
-                    i = obj_to_idx[src_id]
-                    j = obj_to_idx[dst_id]
-                    cnt = max(int(self.edge_count.get((src_id, dst_id), 1)), 1)
-                    edge_feats[i, j] = value / float(cnt)
-
-                eye = torch.eye(n, dtype=torch.bool, device=self.device)
-                edge_feats[eye] = 0.0
-
-                prev_state = None
-                if self._temporal_state_by_objid:
-                    prev_state = torch.zeros(n, self._mpgnn.hidden_dim, dtype=torch.float32, device=self.device)
-                    has_any = False
-                    for i, obj_id in enumerate(inst_ids):
-                        st = self._temporal_state_by_objid.get(int(obj_id))
-                        if st is not None:
-                            prev_state[i] = st
-                            has_any = True
-                    if not has_any:
-                        prev_state = None
-
-                with torch.inference_mode():
-                    logits, new_state = self._mpgnn(node_feats_t, edge_feats, prev_state=prev_state)
-                    probs = torch.sigmoid(logits)
-
-                for i, obj_id in enumerate(inst_ids):
-                    self._temporal_state_by_objid[int(obj_id)] = new_state[i].detach()
-
-                rel_thresh = float(self.rel_threshold)
-                for i in range(n):
-                    src_id = int(inst_ids[i])
-                    for j in range(n):
-                        if i == j:
-                            continue
-                        dst_id = int(inst_ids[j])
-                        active_rel = torch.where(probs[i, j] >= rel_thresh)[0]
-                        for r_i_t in active_rel:
-                            r_i = int(r_i_t.item())
-                            score = float(probs[i, j, r_i].item())
-                            rel_name = (
-                                self.relationship_names[r_i]
-                                if r_i < len(self.relationship_names)
-                                else f"rel_{r_i}"
-                            )
-                            relations.append(
-                                {
-                                    "subject_instance_id": int(src_id),
-                                    "object_instance_id": int(dst_id),
-                                    "predicate_id": int(r_i),
-                                    "predicate": rel_name,
-                                    "score": score,
-                                }
-                            )
-                            relation_instances.add(int(src_id))
-                            relation_instances.add(int(dst_id))
-
-                debug["edge_pairs_total"] = int(len(self.edge_sum))
-            else:
-                # RelationHead-only fallback.
-                for (src_id, dst_id, rel_id), entry in self.relation_cache.items():
-                    if src_id not in obj_to_idx or dst_id not in obj_to_idx:
-                        continue
-                    score = float(entry.get("score", 0.0))
-                    rel_name = entry.get("predicate")
-                    if not isinstance(rel_name, str):
-                        rel_name = self.relationship_names[rel_id] if rel_id < len(self.relationship_names) else f"rel_{rel_id}"
+                    rel_name = (
+                        self.relationship_names[r_i]
+                        if r_i < len(self.relationship_names)
+                        else f"rel_{r_i}"
+                    )
                     relations.append(
                         {
                             "subject_instance_id": int(src_id),
                             "object_instance_id": int(dst_id),
-                            "predicate_id": int(rel_id),
+                            "predicate_id": int(r_i),
                             "predicate": rel_name,
                             "score": score,
                         }
                     )
                     relation_instances.add(int(src_id))
                     relation_instances.add(int(dst_id))
+                    seen_triplets.add((src_id, dst_id, r_i))
 
-                debug["edge_pairs_total"] = int(len(self.relation_cache))
+            for (src_id, dst_id, r_i), mem in self.relation_memory.items():
+                if (src_id, dst_id, r_i) in seen_triplets:
+                    continue
+                if src_id not in obj_to_idx or dst_id not in obj_to_idx:
+                    continue
+                age = max(0, kf_i - int(mem["last_seen_kf"]))
+                score = float(mem["score"]) * (decay ** age)
+                if score < rel_thresh:
+                    continue
+                rel_name = (
+                    self.relationship_names[r_i]
+                    if r_i < len(self.relationship_names)
+                    else f"rel_{r_i}"
+                )
+                relations.append(
+                    {
+                        "subject_instance_id": int(src_id),
+                        "object_instance_id": int(dst_id),
+                        "predicate_id": int(r_i),
+                        "predicate": rel_name,
+                        "score": score,
+                    }
+                )
+                relation_instances.add(int(src_id))
+                relation_instances.add(int(dst_id))
+
+            debug["edge_pairs_total"] = int(len(self.edge_ema))
 
             # Only include nodes that are involved in relations (no orphaned nodes)
             if relation_instances:

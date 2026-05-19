@@ -89,10 +89,6 @@ class Config:
                 "scenegraph_relation_head_checkpoint",
                 "Datasets/3RScan/3RScan/data/scans/relation_branch_hard_negative_bce.pt",
             )
-            self.config_dict.setdefault(
-                "scenegraph_mpgnn_checkpoint",
-                "Datasets/3RScan/3RScan/data/scans/global_scene_graph_mpgnn.pt",
-            )
             self.config_dict.setdefault("scenegraph_relationships_path", "Datasets/3DSSG/3DSSG/relationships.txt")
             self.config_dict.setdefault("scenegraph_min_mask_pixels", 200)
 
