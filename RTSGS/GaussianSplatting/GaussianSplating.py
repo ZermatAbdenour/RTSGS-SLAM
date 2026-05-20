@@ -4,7 +4,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 from gsplat import rendering, spherical_harmonics
-from pytorch_msssim import ssim
+from gsplat.strategy import DefaultStrategy
 
 
 class TokenBucket:
@@ -98,6 +98,19 @@ def frustum_cull_mask(
     return mask
 
 
+_AUX_BUFFERS = [
+    "segmentation_labels",
+    "segmentation_colors",
+    "segmentation_color_logits",
+    "semantic_confidence",
+    "semantic_alt_class",
+    "semantic_alt_confidence",
+    "semantic_switch_support",
+    "semantic_switch_cooldown",
+    "gaussian_instance_ids",
+]
+
+
 class GaussianSplatting:
     def __init__(self, pcd, dataset, tracker, learning_rate=4e-4, max_steps_per_sec=1000, downsample_factor=1.0):
         self.pcd = pcd
@@ -113,7 +126,8 @@ class GaussianSplatting:
         self.train_height = int(self.rgb_height / downsample_factor)
 
         self.num_points_optimized = 0
-        self.optimizer = None
+        self.params = None
+        self.optimizers = None
         self.iteration_count = 0
 
         # Loss and optimization knobs
@@ -125,17 +139,29 @@ class GaussianSplatting:
         # Token-bucket limiter: smooth "max_steps_per_sec"
         self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=100.0)
 
-        self.densify_start_iter = 100
-        self.densify_interval = 300
-        self.grad_threshold = 0.0000002
-        self.xys_grad_norm = None
-        self.vis_counts = None
+        # gsplat DefaultStrategy for densification and pruning
+        # Tuned for incremental SLAM: no opacity reset, continuous refinement
+        self.strategy = DefaultStrategy(
+            prune_opa=0.005,
+            grow_grad2d=0.0002,
+            grow_scale3d=0.01,
+            grow_scale2d=0.05,
+            prune_scale3d=0.1,
+            prune_scale2d=0.15,
+            refine_start_iter=100,
+            refine_stop_iter=10_000_000,
+            reset_every=10_000_000,
+            refine_every=100,
+            absgrad=False,
+            verbose=True,
+        )
+        self.strategy_state = None
 
-        # Culling params (tune)
+        # Culling params (for covisibility and training)
         self.cull_near = 0.05
         self.cull_far = 50.0
         self.cull_pad_px = 4.0
-        self.min_culled_points = 2048  # avoid pathological tiny sets
+        self.min_culled_points = 2048
         # Step rate tracking (timestamps of recent optimizer steps)
         self._step_timestamps = deque()
         self.steps_per_sec = 0.0
@@ -421,141 +447,151 @@ class GaussianSplatting:
 
         return float(inter) / float(denom)
 
+    def _compute_scene_scale(self):
+        means = self.pcd.all_points
+        if means is None or means.shape[0] < 2:
+            return 1.0
+        with torch.no_grad():
+            mn = means.min(dim=0).values
+            mx = means.max(dim=0).values
+            return max(float((mx - mn).norm().item()), 1e-6)
+
     def _setup_optimizer(self):
         if self.pcd.all_points is None:
             return
 
-        old_optimizer = self.optimizer
-        old_num_points = int(self.num_points_optimized)
+        old_params = self.params
+        old_optimizers = self.optimizers
+        old_strategy_state = self.strategy_state
 
-        attrs = ["all_points","all_sh", "all_scales", "all_quaternions", "all_alpha"]
-        for attr in attrs:
-            val = getattr(self.pcd, attr)
-            if not isinstance(val, torch.nn.Parameter):
-                setattr(self.pcd, attr, torch.nn.Parameter(val.detach().requires_grad_(True)))
+        alpha = self.pcd.all_alpha
+        if alpha.ndim == 2 and alpha.shape[-1] == 1:
+            alpha = alpha.squeeze(-1)
 
-        params = [
-            {'params': [self.pcd.all_points], 'lr': self.base_lr * self.points_lr_mult, "name": "points"},
-            {'params': [self.pcd.all_sh], 'lr': self.base_lr * 3.0, "name": "sh"},
-            {'params': [self.pcd.all_scales], 'lr': self.base_lr * 2.0, "name": "scales"},
-            {'params': [self.pcd.all_quaternions], 'lr': self.base_lr * 2.0, "name": "quats"},
-            {'params': [self.pcd.all_alpha], 'lr': self.base_lr, "name": "alphas"},
-        ]
-        self.optimizer = torch.optim.Adam(params)
+        self.params = {
+            "means": torch.nn.Parameter(self.pcd.all_points.detach().clone()),
+            "sh": torch.nn.Parameter(self.pcd.all_sh.detach().clone()),
+            "scales": torch.nn.Parameter(self.pcd.all_scales.detach().clone()),
+            "quats": torch.nn.Parameter(self.pcd.all_quaternions.detach().clone()),
+            "opacities": torch.nn.Parameter(alpha.detach().clone()),
+        }
 
-        # Preserve Adam momentum for pre-existing gaussians when the map grows.
-        if old_optimizer is not None:
-            old_groups = {g.get("name", f"g{i}"): g for i, g in enumerate(old_optimizer.param_groups)}
-            for i, new_group in enumerate(self.optimizer.param_groups):
-                gname = new_group.get("name", f"g{i}")
-                old_group = old_groups.get(gname)
-                if old_group is None or len(old_group.get("params", [])) == 0:
+        lr_map = {
+            "means": self.base_lr * self.points_lr_mult,
+            "sh": self.base_lr * 3.0,
+            "scales": self.base_lr * 2.0,
+            "quats": self.base_lr * 2.0,
+            "opacities": self.base_lr,
+        }
+        self.optimizers = {
+            name: torch.optim.Adam([self.params[name]], lr=lr)
+            for name, lr in lr_map.items()
+        }
+
+        # Carry Adam momentum for pre-existing gaussians across map growth
+        if old_optimizers is not None and old_params is not None:
+            for name in lr_map:
+                if name not in old_optimizers or name not in old_params:
                     continue
-                if len(new_group.get("params", [])) == 0:
-                    continue
-
-                old_param = old_group["params"][0]
-                new_param = new_group["params"][0]
-
-                old_state = old_optimizer.state.get(old_param, None)
+                old_opt = old_optimizers[name]
+                old_p = old_params[name]
+                old_state = old_opt.state.get(old_p)
                 if old_state is None:
                     continue
 
-                new_state = self.optimizer.state[new_param]
+                new_opt = self.optimizers[name]
+                new_p = self.params[name]
+                new_state = new_opt.state.setdefault(new_p, {})
 
                 if "step" in old_state:
-                    old_step = old_state["step"]
-                    new_state["step"] = old_step.clone() if torch.is_tensor(old_step) else old_step
+                    new_state["step"] = old_state["step"]
 
-                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
-                    old_tensor = old_state.get(key, None)
-                    if old_tensor is None or (not torch.is_tensor(old_tensor)):
+                for key in ("exp_avg", "exp_avg_sq"):
+                    old_t = old_state.get(key)
+                    if old_t is None or not torch.is_tensor(old_t):
                         continue
+                    new_t = torch.zeros_like(new_p.data)
+                    n_copy = min(old_t.shape[0], new_t.shape[0])
+                    if n_copy > 0:
+                        new_t[:n_copy].copy_(old_t[:n_copy])
+                    new_state[key] = new_t
 
-                    new_tensor = torch.zeros_like(new_param.data)
+        # Extend strategy state instead of resetting it
+        scene_scale = self._compute_scene_scale()
+        new_n = self.params["means"].shape[0]
 
-                    if old_tensor.shape == new_tensor.shape:
-                        new_tensor.copy_(old_tensor)
-                    elif old_tensor.ndim == new_tensor.ndim and old_tensor.ndim > 0 and old_tensor.shape[1:] == new_tensor.shape[1:]:
-                        n_copy = min(int(old_tensor.shape[0]), int(new_tensor.shape[0]))
-                        if n_copy > 0:
-                            new_tensor[:n_copy].copy_(old_tensor[:n_copy])
-
-                    new_state[key] = new_tensor
-
-        self.num_points_optimized = self.pcd.all_points.shape[0]
-        if self.xys_grad_norm is None or self.vis_counts is None:
-            self.xys_grad_norm = torch.zeros(self.num_points_optimized, device=self.device)
-            self.vis_counts = torch.zeros(self.num_points_optimized, device=self.device)
+        if old_strategy_state is not None and old_strategy_state.get("grad2d") is not None:
+            self.strategy_state = {"scene_scale": scene_scale}
+            for key in ("grad2d", "count", "radii"):
+                old_t = old_strategy_state.get(key)
+                if old_t is None or not torch.is_tensor(old_t):
+                    if key == "radii":
+                        continue
+                    self.strategy_state[key] = torch.zeros(new_n, device=self.device)
+                    continue
+                new_t = torch.zeros(new_n, device=self.device)
+                n_copy = min(old_t.shape[0], new_n)
+                if n_copy > 0:
+                    new_t[:n_copy].copy_(old_t[:n_copy])
+                self.strategy_state[key] = new_t
         else:
-            new_grad_norm = torch.zeros(self.num_points_optimized, device=self.device)
-            new_vis_counts = torch.zeros(self.num_points_optimized, device=self.device)
-            n_copy = min(old_num_points, self.num_points_optimized)
-            if n_copy > 0:
-                new_grad_norm[:n_copy] = self.xys_grad_norm[:n_copy]
-                new_vis_counts[:n_copy] = self.vis_counts[:n_copy]
-            self.xys_grad_norm = new_grad_norm
-            self.vis_counts = new_vis_counts
+            self.strategy_state = self.strategy.initialize_state(scene_scale=scene_scale)
 
-    def densify(self):
-        avg_grads = self.xys_grad_norm / (self.vis_counts + 1e-7)
-        avg_grads[torch.isnan(avg_grads)] = 0.0
+        # Put auxiliary pcd buffers in strategy_state so the strategy ops
+        # (split/duplicate/remove) keep them aligned with the gaussians.
+        for buf_name in _AUX_BUFFERS:
+            buf = getattr(self.pcd, buf_name, None)
+            if buf is not None and torch.is_tensor(buf) and buf.shape[0] == new_n:
+                self.strategy_state[buf_name] = buf.detach().clone()
 
-        mask = avg_grads >= self.grad_threshold
-        num_to_add = mask.sum().item()
-        if num_to_add == 0:
+        self.num_points_optimized = new_n
+        self._sync_pcd_from_params()
+
+    def _sync_pcd_from_params(self):
+        """Write params (and aux buffers from strategy_state) back to pcd."""
+        if self.params is None:
             return
-
-        print(
-            f"\033[92m[Iter {self.iteration_count}] Densifying: {num_to_add} points. "
-            f"Total: {self.pcd.all_points.shape[0] + num_to_add}\033[0m"
-        )
-
-        with torch.no_grad():
-            new_points = self.pcd.all_points[mask].clone()
-            new_sh = self.pcd.all_sh[mask].clone()
-            new_quats = self.pcd.all_quaternions[mask].clone()
-
-            new_scales = torch.full_like(self.pcd.all_scales[mask], -4.0)
-            new_alphas = torch.full_like(self.pcd.all_alpha[mask], 0.0)
-
-            self.pcd.all_points = torch.cat([self.pcd.all_points.detach(), new_points.detach()], dim=0)
-            self.pcd.all_sh = torch.cat([self.pcd.all_sh.detach(), new_sh.detach()], dim=0)
-            self.pcd.all_scales = torch.cat([self.pcd.all_scales.detach(), new_scales.detach()], dim=0)
-            self.pcd.all_quaternions = torch.cat([self.pcd.all_quaternions.detach(), new_quats.detach()], dim=0)
-            self.pcd.all_alpha = torch.cat([self.pcd.all_alpha.detach(), new_alphas.detach()], dim=0)
-
-        self._setup_optimizer()
+        self.pcd.all_points = self.params["means"]
+        self.pcd.all_sh = self.params["sh"]
+        self.pcd.all_scales = self.params["scales"]
+        self.pcd.all_quaternions = self.params["quats"]
+        opacities = self.params["opacities"]
+        self.pcd.all_alpha = opacities.unsqueeze(-1) if opacities.ndim == 1 else opacities
+        if self.strategy_state is not None:
+            for buf_name in _AUX_BUFFERS:
+                if buf_name in self.strategy_state:
+                    v = self.strategy_state[buf_name]
+                    if isinstance(v, torch.Tensor):
+                        setattr(self.pcd, buf_name, v)
 
     def training_step(self):
-        # Smoothly limit optimization steps to ~max_steps_per_sec
         if not self.step_limiter.allow(cost=1.0):
             return 0.0
 
-        # no lock (as requested)
         if self.pcd.all_points is None or not self.tracker.keyframes_poses:
             return 0.0
 
         self.iteration_count += 1
 
-        if self.optimizer is None or self.pcd.all_points.shape[0] != self.num_points_optimized:
+        current_count = self.pcd.all_points.shape[0]
+        if self.params is None or current_count != self.num_points_optimized:
             self._setup_optimizer()
-            if self.optimizer is None:
+            if self.params is None:
                 return 0.0
 
-        self.optimizer.zero_grad(set_to_none=True)
+        for opt in self.optimizers.values():
+            opt.zero_grad(set_to_none=True)
 
-        means_all = self.pcd.all_points
-        sh_all = self.pcd.all_sh
-        scales_all = self.pcd.all_scales
-        quats_all = self.pcd.all_quaternions
-        alpha_all = self.pcd.all_alpha
+        means = self.params["means"]
+        sh = self.params["sh"]
+        scales = self.params["scales"]
+        quats = self.params["quats"]
+        opacities = self.params["opacities"]
         sh_degree = self.pcd.sh_degree
         R_fix = self.pcd.R_fix
 
         kf_count = len(self.tracker.keyframes_poses)
 
-        # Always include the latest keyframe; optionally add a covisible older one.
         self._ensure_keyframe_covis_masks()
         latest_idx = kf_count - 1
         sample_idx = np.array([latest_idx], dtype=np.int64)
@@ -588,7 +624,6 @@ class GaussianSplatting:
         gt_depth_np = [self.dataset.depth_keyframes[i] for i in sample_idx] if can_use_depth else None
         poses_np = [self.tracker.keyframes_poses[i].copy() for i in sample_idx]
 
-        # 1) GT (downsample)
         gt_rgbs_full = torch.stack(
             [torch.from_numpy(img).to(self.device).float().mul_(1.0 / 255.0) for img in gt_rgb_np]
         )
@@ -610,7 +645,6 @@ class GaussianSplatting:
                 mode='nearest'
             ).squeeze(1)
 
-        # 2) Camera mats
         T_fix = torch.eye(4, device=self.device)
         T_fix[:3, :3] = R_fix
 
@@ -634,10 +668,10 @@ class GaussianSplatting:
         )
         Ks = K.unsqueeze(0).expand(b, -1, -1)
 
-        # 3) Frustum culling
+        # Frustum culling (keeps gradients flowing to full params via indexing)
         with torch.no_grad():
             cull_mask = frustum_cull_mask(
-                means_world=means_all.detach(),
+                means_world=means.detach(),
                 viewmats=viewmats.detach(),
                 Ks=Ks.detach(),
                 width=self.train_width,
@@ -646,33 +680,26 @@ class GaussianSplatting:
                 far=self.cull_far,
                 pad=self.cull_pad_px,
             )
-
-            # Avoid too small set
             if cull_mask.sum() < self.min_culled_points:
                 cull_mask = torch.ones_like(cull_mask, dtype=torch.bool)
 
         idx = torch.where(cull_mask)[0]
+        means_c = means[idx]
+        sh_c = sh[idx]
+        scales_c = scales[idx]
+        quats_c = quats[idx]
+        opacities_c = opacities[idx]
 
-        means = means_all[idx]
-        sh = sh_all[idx]
-        scales = scales_all[idx]
-        quats = quats_all[idx]
-        alpha = alpha_all[idx]
-
-        # 4) SH colors on culled set
-        dirs = means.unsqueeze(0) - cam_centers.unsqueeze(1)
+        dirs = means_c.unsqueeze(0) - cam_centers.unsqueeze(1)
         dirs = F.normalize(dirs, dim=-1)
-
-        sh_coeffs = sh.unsqueeze(0).expand(b, -1, -1, -1)
+        sh_coeffs = sh_c.unsqueeze(0).expand(b, -1, -1, -1)
         colors = torch.sigmoid(spherical_harmonics(sh_degree, dirs, sh_coeffs))
 
-        # 5) Rasterization on culled set
-
         rendered, _, info = rendering.rasterization(
-            means=means,
-            quats=F.normalize(quats, p=2, dim=-1),
-            scales=torch.exp(scales),
-            opacities=torch.sigmoid(alpha).squeeze(-1),
+            means=means_c,
+            quats=F.normalize(quats_c, p=2, dim=-1),
+            scales=torch.exp(scales_c),
+            opacities=torch.sigmoid(opacities_c),
             colors=colors,
             viewmats=viewmats,
             Ks=Ks,
@@ -681,18 +708,21 @@ class GaussianSplatting:
             render_mode="RGB+ED",
         )
 
+        # Remap packed gaussian_ids from culled-local to global indices
+        # so the strategy accumulates stats for the correct gaussians
+        if "gaussian_ids" in info and info["gaussian_ids"] is not None:
+            info["gaussian_ids"] = idx[info["gaussian_ids"]]
+
+        self.strategy.step_pre_backward(
+            self.params, self.optimizers, self.strategy_state,
+            self.iteration_count, info,
+        )
 
         rendered_rgb = rendered[..., :3]
         rendered_depth = rendered[..., 3] if rendered.shape[-1] > 3 else None
 
-        # 6) Loss/backward
         l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
-        # ssim_val = ssim(
-        #     rendered_rgb.permute(0, 3, 1, 2),
-        #     gt_rgbs.permute(0, 3, 1, 2),
-        #     data_range=1.0
-        # )
-        rgb_loss = l1_loss #+ 0.2 * (1.0 - ssim_val)
+        rgb_loss = l1_loss
 
         depth_loss = torch.zeros((), device=self.device)
         if gt_depths is not None and rendered_depth is not None:
@@ -708,18 +738,30 @@ class GaussianSplatting:
 
         if total_loss > 0:
             total_loss.backward()
-            self.optimizer.step()
-            # record a performed optimization step timestamp and compute recent rate
-       
+
+            # Track whether the strategy replaces params (densify/prune).
+            # If it does, we must sync new params back to pcd.
+            # If it doesn't, the optimizer updates params in-place and
+            # pcd already sees the changes (pcd attrs ARE the param objects).
+            means_before = self.params["means"]
+
+            self.strategy.step_post_backward(
+                self.params, self.optimizers, self.strategy_state,
+                self.iteration_count, info, packed=True,
+            )
+
+            for opt in self.optimizers.values():
+                opt.step()
+
+            if means_before is not self.params["means"]:
+                self._sync_pcd_from_params()
+                self.num_points_optimized = self.params["means"].shape[0]
+
             now = time.time()
             self._step_timestamps.append(now)
-            # drop older than 1s
             cutoff = now - 1.0
             while self._step_timestamps and self._step_timestamps[0] < cutoff:
                 self._step_timestamps.popleft()
             self.steps_per_sec = float(len(self._step_timestamps))
-        # 7) Densify
-        if self.iteration_count > self.densify_start_iter and self.iteration_count % self.densify_interval == 0:
-            self.densify()
 
         return float(total_loss.detach().item())

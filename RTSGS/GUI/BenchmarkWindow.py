@@ -680,7 +680,7 @@ class BenchmarkWindow:
                 continue
 
             # Convention: evaluate in OpenCV BGR uint8.
-            pred_bgr = np.asarray(pred, dtype=np.uint8)[..., ::-1].copy()
+            pred_bgr = np.asarray(pred, dtype=np.uint8).copy()
             seg_bgr = np.asarray(seg, dtype=np.uint8)
             if seg_bgr.ndim == 3 and seg_bgr.shape[2] == 3:
                 # Match the same channel order used for previews/metrics.

@@ -11,8 +11,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.init()
 
-    data_path = "./Datasets/Replica/ThirdParty/Replica/office3/results"
-    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/office3/traj.txt"
+    data_path = "./Datasets/Replica/ThirdParty/Replica/office0/results"
+    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/office0/traj.txt"
     data = ReplicaDataLoader(data_path=data_path, trajectory_path=trajectory_path)
 
     config = load_config("configs/replica.yaml")
