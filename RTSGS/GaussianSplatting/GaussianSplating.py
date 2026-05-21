@@ -154,6 +154,7 @@ def frustum_cull_mask(
 
 
 _AUX_BUFFERS = [
+    "gaussian_birth_iter",
     "segmentation_labels",
     "segmentation_colors",
     "segmentation_color_logits",
@@ -275,6 +276,90 @@ class GaussianSplatting:
             return None
 
         # ED may return (..., 1) or (...,) depending on gsplat version.
+        if rendered.ndim == 4 and rendered.shape[-1] >= 1:
+            depth = rendered[0, ..., 0]
+        elif rendered.ndim == 3:
+            depth = rendered[0, ...]
+        else:
+            return None
+
+        depth = depth.detach().to(torch.float32).cpu().numpy()
+        depth[~np.isfinite(depth)] = 0.0
+        depth[depth < 0.0] = 0.0
+        return depth
+
+    @torch.no_grad()
+    def render_reliable_depth_at_pose(
+        self,
+        pose_np: np.ndarray,
+        max_scale: float = 0.05,
+        min_opacity: float = 0.3,
+        min_maturity: int = 2,
+    ):
+        if self.pcd.all_points is None or pose_np is None:
+            return None
+
+        with self.pcd.lock:
+            means = self.pcd.all_points
+            quats = self.pcd.all_quaternions
+            scales = self.pcd.all_scales
+            alpha = self.pcd.all_alpha
+            birth = self.pcd.gaussian_birth_iter
+            birth_counter = self.pcd._birth_counter
+
+        if means is None or means.shape[0] == 0:
+            return None
+
+        opacities = torch.sigmoid(alpha).squeeze(-1)
+        world_scales = torch.exp(scales).max(dim=-1).values
+
+        reliable = (
+            (world_scales <= max_scale)
+            & (opacities >= min_opacity)
+        )
+        if birth is not None:
+            reliable = reliable & ((birth_counter - birth) >= min_maturity)
+
+        idx = torch.where(reliable)[0]
+        if idx.shape[0] == 0:
+            return None
+
+        means = means[idx]
+        quats = quats[idx]
+        scales = scales[idx]
+        opacities = opacities[idx]
+
+        pose = torch.from_numpy(np.asarray(pose_np, dtype=np.float32)).to(self.device)
+        T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        T_fix[:3, :3] = self.pcd.R_fix
+        viewmat = torch.inverse(T_fix @ pose).unsqueeze(0)
+
+        K = _build_K(
+            fx=float(self.pcd.fx),
+            fy=float(self.pcd.fy),
+            cx=float(self.pcd.cx),
+            cy=float(self.pcd.cy),
+            device=self.device,
+        ).unsqueeze(0)
+
+        ones = torch.ones((means.shape[0], 3), device=self.device, dtype=means.dtype)
+
+        try:
+            rendered, _, _ = rendering.rasterization(
+                means=means,
+                quats=F.normalize(quats, p=2, dim=-1),
+                scales=torch.exp(scales),
+                opacities=opacities,
+                colors=ones,
+                viewmats=viewmat,
+                Ks=K,
+                width=self.depth_width,
+                height=self.depth_height,
+                render_mode="ED",
+            )
+        except Exception:
+            return None
+
         if rendered.ndim == 4 and rendered.shape[-1] >= 1:
             depth = rendered[0, ..., 0]
         elif rendered.ndim == 3:

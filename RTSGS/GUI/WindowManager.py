@@ -63,6 +63,7 @@ class WindowManager:
 
         self.renderer = GlfwRenderer(self.window)
 
+        self.tracker = tracker
         # windows
         self.performance_window = PerformanceWindow()
         self.profiler_window = ProfilerWindow()
@@ -112,6 +113,12 @@ class WindowManager:
                 clicked, _ = imgui.menu_item("Scene Graph", "", self.scene_graph_window.is_open, True)
                 if clicked:
                     self.scene_graph_window.is_open = not self.scene_graph_window.is_open
+
+                if self.tracker is not None and hasattr(self.tracker, "show_matching_window"):
+                    clicked, _ = imgui.menu_item("Tracker", "", self.tracker.show_matching_window, True)
+                    if clicked:
+                        self.tracker.show_matching_window = not self.tracker.show_matching_window
+
                 # Benchmark menu item only if available
                 if self.benchmark_window is not None:
                     clicked, _ = imgui.menu_item("Benchmark", "", self.benchmark_window.is_open, True)

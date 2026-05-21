@@ -41,7 +41,7 @@ class RTSGSSystem:
         self.pcd = PointCloud(config)
         self.gs = GaussianSplatting(self.pcd, self.dataset, self.tracker)
         if hasattr(self.tracker, "set_rendered_depth_provider"):
-            self.tracker.set_rendered_depth_provider(self.gs.render_depth_at_pose)
+            self.tracker.set_rendered_depth_provider(self.gs.render_reliable_depth_at_pose)
         if hasattr(self.tracker, "set_rendered_rgb_provider"):
             self.tracker.set_rendered_rgb_provider(self.gs.render_rgb_at_pose)
         if hasattr(self.pcd, "set_rendered_depth_provider"):
@@ -80,6 +80,8 @@ class RTSGSSystem:
         self.benchmark: BenchmarkCollector | None = None
         self._trajectory_done = False
         self.stop_training_on_trajectory_end = True
+        self._post_trajectory_steps = 1000
+        self._post_trajectory_step_count = 0
 
 
     def run(self, benchmark: bool = False):
@@ -123,7 +125,11 @@ class RTSGSSystem:
                     self.benchmark.mark_trajectory_ended()
             
             # 2. Run a training step (Optimization)
-            if not (self.stop_training_on_trajectory_end and self._trajectory_done):
+            if self._trajectory_done and self.stop_training_on_trajectory_end:
+                if self._post_trajectory_step_count < self._post_trajectory_steps:
+                    self.gs.training_step()
+                    self._post_trajectory_step_count += 1
+            else:
                 self.gs.training_step()
 
             # 3. Asynchronous Map Update

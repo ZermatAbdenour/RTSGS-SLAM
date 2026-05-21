@@ -53,6 +53,9 @@ class PointCloud:
         self.all_quaternions = None
         self.all_alpha = None
 
+        self.gaussian_birth_iter = None
+        self._birth_counter = 0
+
         # Segmentation outputs (aligned 1:1 with all_points).
         self.segmentation_labels = None
         self.segmentation_colors = None
@@ -344,6 +347,16 @@ class PointCloud:
                 self.all_scales = torch.cat([self.all_scales, new_data[2]])
                 self.all_quaternions = torch.cat([self.all_quaternions, new_data[3]])
                 self.all_alpha = torch.cat([self.all_alpha, new_data[4]])
+
+            num_new = int(new_data[0].shape[0])
+            self._birth_counter += 1
+            new_birth = torch.full(
+                (num_new,), self._birth_counter, dtype=torch.int32, device=self.device
+            )
+            if self.gaussian_birth_iter is None:
+                self.gaussian_birth_iter = new_birth
+            else:
+                self.gaussian_birth_iter = torch.cat([self.gaussian_birth_iter, new_birth])
 
             # Keep segmentation buffers aligned after map growth.
             if self.segmentation_labels is not None:
