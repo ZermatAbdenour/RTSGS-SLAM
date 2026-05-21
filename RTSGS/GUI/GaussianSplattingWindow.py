@@ -52,11 +52,19 @@ def _sigmoid_inplace(x: torch.Tensor) -> torch.Tensor:
     return x
 
 
+MODE_FREE_ROAMING = 0
+MODE_LAST_POSE = 1
+MODE_EXTRAPOLATED = 2
+_MODE_LABELS = ["Free Roaming", "Last Pose", "Extrapolated Pose"]
+
+
 class GaussianSplattingWindow:
-    def __init__(self, pcd: PointCloud, camera: Camera, title: str = "GSplat Renderer"):
+    def __init__(self, pcd: PointCloud, camera: Camera, title: str = "GSplat Renderer", tracker=None):
         self.pcd = pcd
         self.camera = camera
         self.title = title
+        self.tracker = tracker
+        self.camera_mode = MODE_FREE_ROAMING
 
         self.device = getattr(pcd, "device", torch.device("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -81,6 +89,14 @@ class GaussianSplattingWindow:
         self._default_quat = torch.tensor([0.0, 0.0, 0.0, 1.0], device=self.device, dtype=torch.float32)
         self._default_opacity = torch.tensor(1.0, device=self.device, dtype=torch.float32)
 
+        self._T_fix = torch.eye(4, device=self.device, dtype=torch.float32)
+        self._T_fix[:3, :3] = pcd.R_fix
+
+        self._rgb_fx = float(getattr(pcd, "rgb_fx", self.fx))
+        self._rgb_fy = float(getattr(pcd, "rgb_fy", self.fy))
+        self._rgb_cx = float(getattr(pcd, "rgb_cx", 0))
+        self._rgb_cy = float(getattr(pcd, "rgb_cy", 0))
+
         # references to latest pcd buffers
         self._xyz = None
         self._sh = None
@@ -101,11 +117,20 @@ class GaussianSplattingWindow:
     def _ensure_intrinsics(self):
         w, h = self.camera.width, self.camera.height
         if self._K is None or w != self._K_w or h != self._K_h:
-            # precompute K once per resize
             self._K = torch.tensor(
                 [[self.fx, 0.0, w * 0.5], [0.0, self.fy, h * 0.5], [0.0, 0.0, 1.0]],
                 device=self.device,
                 dtype=torch.float32,
+            ).unsqueeze(0)
+            native_w = self._rgb_cx * 2.0
+            native_h = self._rgb_cy * 2.0
+            sx = w / native_w if native_w > 0 else 1.0
+            sy = h / native_h if native_h > 0 else 1.0
+            self._tracker_K = torch.tensor(
+                [[self._rgb_fx * sx, 0.0, self._rgb_cx * sx],
+                 [0.0, self._rgb_fy * sy, self._rgb_cy * sy],
+                 [0.0, 0.0, 1.0]],
+                device=self.device, dtype=torch.float32,
             ).unsqueeze(0)
             self._K_w, self._K_h = w, h
 
@@ -123,6 +148,33 @@ class GaussianSplattingWindow:
         self._o_default = self._default_opacity.expand(N)
 
         self._last_N = N
+
+    def _get_tracker_pose(self):
+        if self.tracker is None:
+            return None
+        poses = self.tracker.poses
+        if not poses:
+            return None
+        if self.camera_mode == MODE_LAST_POSE:
+            return poses[-1]
+        if self.camera_mode == MODE_EXTRAPOLATED:
+            return self._pull_back_pose(poses[-1])
+        return None
+
+    @torch.no_grad()
+    def _viewmat_from_tracker_pose(self, pose_np: np.ndarray):
+        pose = torch.from_numpy(np.asarray(pose_np, dtype=np.float32)).to(self.device)
+        world_cam = self._T_fix @ pose
+        viewmat = torch.inverse(world_cam)
+        cam_center = world_cam[:3, 3]
+        return viewmat, cam_center
+
+    @staticmethod
+    def _pull_back_pose(pose_np: np.ndarray, distance: float = 0.5) -> np.ndarray:
+        pose = pose_np.astype(np.float64).copy()
+        forward = pose[:3, 2]
+        pose[:3, 3] -= forward * distance
+        return pose.astype(np.float32)
 
     def _pull_latest_buffers(self) -> bool:
         p = self.pcd
@@ -184,16 +236,21 @@ class GaussianSplattingWindow:
 
     @torch.no_grad()
     def _render_with_gsplat(self) -> np.ndarray:
-        self.camera.update_view()
         self._ensure_intrinsics()
 
         xyz = self._xyz
         N = xyz.shape[0]
         self._ensure_scratch(N, xyz)
 
-        cam_center = _fill_viewmat_and_camcenter_from_view_np(
-            self.camera.view, self.device, self._viewmat, self._flip
-        )
+        tracker_pose = self._get_tracker_pose()
+        if tracker_pose is not None and self.camera_mode != MODE_FREE_ROAMING:
+            viewmat, cam_center = self._viewmat_from_tracker_pose(tracker_pose)
+            self._viewmat.copy_(viewmat)
+        else:
+            self.camera.update_view()
+            cam_center = _fill_viewmat_and_camcenter_from_view_np(
+                self.camera.view, self.device, self._viewmat, self._flip
+            )
 
         # Colors
         sh = self._sh
@@ -232,6 +289,7 @@ class GaussianSplattingWindow:
         else:
             o = self._o_default
 
+        use_tracker = tracker_pose is not None and self.camera_mode != MODE_FREE_ROAMING
         img, _, _ = rendering.rasterization(
             means=xyz,
             quats=q,
@@ -239,7 +297,7 @@ class GaussianSplattingWindow:
             opacities=o,
             colors=c,
             viewmats=self._viewmat.unsqueeze(0),
-            Ks=self._K,
+            Ks=self._tracker_K if use_tracker else self._K,
             width=self.camera.width,
             height=self.camera.height,
             render_mode="RGB",
@@ -256,13 +314,19 @@ class GaussianSplattingWindow:
             imgui.end()
             return
 
+        imgui.set_next_item_width(180)
+        changed, new_mode = imgui.combo("Camera Mode", self.camera_mode, _MODE_LABELS)
+        if changed:
+            self.camera_mode = new_mode
+
         avail = imgui.get_content_region_avail()
         w, h = int(avail.x), int(avail.y)
         if (w != self.camera.width) or (h != self.camera.height):
             if w > 0 and h > 0:
                 self.camera.update_resolution(w, h)
 
-        self.camera.process_window_input(imgui.is_window_hovered(), imgui.is_window_focused(), delta_time)
+        if self.camera_mode == MODE_FREE_ROAMING:
+            self.camera.process_window_input(imgui.is_window_hovered(), imgui.is_window_focused(), delta_time)
 
         if self._pull_latest_buffers():
             rgb = self._render_with_gsplat()

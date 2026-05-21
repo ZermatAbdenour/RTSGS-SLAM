@@ -72,7 +72,7 @@ class WindowManager:
         camera = Camera()
         self.opengl_renderer = Renderer(point_cloud, camera, tracker=tracker, dataset=dataset)
         self.viewport_window = ViewportWindow(self.opengl_renderer)
-        self.gaussian_splating_window = GaussianSplattingWindow(point_cloud,camera)
+        self.gaussian_splating_window = GaussianSplattingWindow(point_cloud, camera, tracker=tracker)
         self.segmentation_legend_window = SegmentationLegendWindow(point_cloud, self.opengl_renderer)
         self.scene_graph_window = SceneGraphWindow(point_cloud)
         # Benchmark window (created on demand via enable_benchmark_window)
