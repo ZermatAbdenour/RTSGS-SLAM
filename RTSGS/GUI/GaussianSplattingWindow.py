@@ -126,51 +126,54 @@ class GaussianSplattingWindow:
 
     def _pull_latest_buffers(self) -> bool:
         p = self.pcd
-        xyz = getattr(p, "all_points", None)
-        if xyz is None or xyz.numel() == 0:
-            return False
+        # Snapshot all attributes under the lock so background threads
+        # (_merge_data, _sync_pcd_from_params) cannot change sizes mid-read.
+        with p.lock:
+            xyz = getattr(p, "all_points", None)
+            if xyz is None or xyz.numel() == 0:
+                return False
 
-        xyz = xyz.detach()
-        sh = getattr(p, "all_sh", None)
-        sh = sh.detach() if sh is not None else None
+            xyz = xyz.detach()
+            sh = getattr(p, "all_sh", None)
+            sh = sh.detach() if sh is not None else None
 
-        q = getattr(p, "all_quaternions", None)
-        q = q.detach() if q is not None else None
+            q = getattr(p, "all_quaternions", None)
+            q = q.detach() if q is not None else None
 
-        s = getattr(p, "all_scales", None)
-        s = s.detach() if s is not None else None
+            s = getattr(p, "all_scales", None)
+            s = s.detach() if s is not None else None
 
-        a = getattr(p, "all_alpha", None)
-        a = a.detach() if a is not None else None
+            a = getattr(p, "all_alpha", None)
+            a = a.detach() if a is not None else None
 
-        seg_filter = getattr(p, "segmentation_class_filter", None)
-        if seg_filter is not None:
-            labels = getattr(p, "segmentation_labels", None)
-            if labels is not None and int(labels.shape[0]) == int(xyz.shape[0]):
-                labels = labels.detach()
-                if isinstance(seg_filter, (list, tuple, set)):
-                    keep = torch.zeros_like(labels, dtype=torch.bool)
-                    for cls_id in seg_filter:
-                        try:
-                            keep |= (labels == int(cls_id))
-                        except Exception:
-                            continue
-                else:
+            seg_filter = getattr(p, "segmentation_class_filter", None)
+            labels = getattr(p, "segmentation_labels", None) if seg_filter is not None else None
+
+        if seg_filter is not None and labels is not None and int(labels.shape[0]) == int(xyz.shape[0]):
+            labels = labels.detach()
+            if isinstance(seg_filter, (list, tuple, set)):
+                keep = torch.zeros_like(labels, dtype=torch.bool)
+                for cls_id in seg_filter:
                     try:
-                        keep = labels == int(seg_filter)
+                        keep |= (labels == int(cls_id))
                     except Exception:
-                        keep = None
+                        continue
+            else:
+                try:
+                    keep = labels == int(seg_filter)
+                except Exception:
+                    keep = None
 
-                if keep is not None:
-                    xyz = xyz[keep]
-                    if sh is not None and int(sh.shape[0]) == int(keep.shape[0]):
-                        sh = sh[keep]
-                    if q is not None and int(q.shape[0]) == int(keep.shape[0]):
-                        q = q[keep]
-                    if s is not None and int(s.shape[0]) == int(keep.shape[0]):
-                        s = s[keep]
-                    if a is not None and int(a.shape[0]) == int(keep.shape[0]):
-                        a = a[keep]
+            if keep is not None:
+                xyz = xyz[keep]
+                if sh is not None and int(sh.shape[0]) == int(keep.shape[0]):
+                    sh = sh[keep]
+                if q is not None and int(q.shape[0]) == int(keep.shape[0]):
+                    q = q[keep]
+                if s is not None and int(s.shape[0]) == int(keep.shape[0]):
+                    s = s[keep]
+                if a is not None and int(a.shape[0]) == int(keep.shape[0]):
+                    a = a[keep]
 
         self._xyz = xyz
         self._sh = sh

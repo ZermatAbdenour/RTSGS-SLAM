@@ -178,10 +178,11 @@ class GaussianSplatting:
         if pose_np is None:
             return None
 
-        means = self.pcd.all_points
-        quats = self.pcd.all_quaternions
-        scales = self.pcd.all_scales
-        alpha = self.pcd.all_alpha
+        with self.pcd.lock:
+            means = self.pcd.all_points
+            quats = self.pcd.all_quaternions
+            scales = self.pcd.all_scales
+            alpha = self.pcd.all_alpha
 
         if means is None or means.shape[0] == 0:
             return None
@@ -243,11 +244,12 @@ class GaussianSplatting:
         if pose_np is None:
             return None
 
-        means = self.pcd.all_points
-        quats = self.pcd.all_quaternions
-        scales = self.pcd.all_scales
-        alpha = self.pcd.all_alpha
-        sh = self.pcd.all_sh
+        with self.pcd.lock:
+            means = self.pcd.all_points
+            quats = self.pcd.all_quaternions
+            scales = self.pcd.all_scales
+            alpha = self.pcd.all_alpha
+            sh = self.pcd.all_sh
 
         if means is None or means.shape[0] == 0:
             return None
@@ -304,15 +306,16 @@ class GaussianSplatting:
         if pose_np is None:
             return None
 
-        means = self.pcd.all_points
-        quats = self.pcd.all_quaternions
-        scales = self.pcd.all_scales
-        alpha = self.pcd.all_alpha
+        with self.pcd.lock:
+            means = self.pcd.all_points
+            quats = self.pcd.all_quaternions
+            scales = self.pcd.all_scales
+            alpha = self.pcd.all_alpha
+            seg_colors = getattr(self.pcd, "segmentation_colors", None)
 
         if means is None or means.shape[0] == 0:
             return None
 
-        seg_colors = getattr(self.pcd, "segmentation_colors", None)
         if seg_colors is None:
             return None
         if torch.is_tensor(seg_colors):
@@ -464,17 +467,28 @@ class GaussianSplatting:
         old_optimizers = self.optimizers
         old_strategy_state = self.strategy_state
 
-        alpha = self.pcd.all_alpha
-        if alpha.ndim == 2 and alpha.shape[-1] == 1:
-            alpha = alpha.squeeze(-1)
+        # Snapshot pcd under the lock so _merge_data cannot interleave and
+        # cause size mismatches between the cloned tensors.
+        with self.pcd.lock:
+            alpha = self.pcd.all_alpha
+            if alpha.ndim == 2 and alpha.shape[-1] == 1:
+                alpha = alpha.squeeze(-1)
 
-        self.params = {
-            "means": torch.nn.Parameter(self.pcd.all_points.detach().clone()),
-            "sh": torch.nn.Parameter(self.pcd.all_sh.detach().clone()),
-            "scales": torch.nn.Parameter(self.pcd.all_scales.detach().clone()),
-            "quats": torch.nn.Parameter(self.pcd.all_quaternions.detach().clone()),
-            "opacities": torch.nn.Parameter(alpha.detach().clone()),
-        }
+            self.params = {
+                "means": torch.nn.Parameter(self.pcd.all_points.detach().clone()),
+                "sh": torch.nn.Parameter(self.pcd.all_sh.detach().clone()),
+                "scales": torch.nn.Parameter(self.pcd.all_scales.detach().clone()),
+                "quats": torch.nn.Parameter(self.pcd.all_quaternions.detach().clone()),
+                "opacities": torch.nn.Parameter(alpha.detach().clone()),
+            }
+            n_snap = self.params["means"].shape[0]
+
+            # Snapshot aux buffers while still under the lock.
+            aux_snaps = {}
+            for buf_name in _AUX_BUFFERS:
+                buf = getattr(self.pcd, buf_name, None)
+                if buf is not None and torch.is_tensor(buf) and buf.shape[0] == n_snap:
+                    aux_snaps[buf_name] = buf.detach().clone()
 
         lr_map = {
             "means": self.base_lr * self.points_lr_mult,
@@ -539,30 +553,33 @@ class GaussianSplatting:
 
         # Put auxiliary pcd buffers in strategy_state so the strategy ops
         # (split/duplicate/remove) keep them aligned with the gaussians.
-        for buf_name in _AUX_BUFFERS:
-            buf = getattr(self.pcd, buf_name, None)
-            if buf is not None and torch.is_tensor(buf) and buf.shape[0] == new_n:
-                self.strategy_state[buf_name] = buf.detach().clone()
+        for buf_name, buf_t in aux_snaps.items():
+            self.strategy_state[buf_name] = buf_t
 
         self.num_points_optimized = new_n
         self._sync_pcd_from_params()
 
     def _sync_pcd_from_params(self):
-        """Write params (and aux buffers from strategy_state) back to pcd."""
+        """Write params (and aux buffers from strategy_state) back to pcd.
+
+        Holds pcd.lock so that background threads (segmenter, scene-graph)
+        never see half-updated attribute sizes.
+        """
         if self.params is None:
             return
-        self.pcd.all_points = self.params["means"]
-        self.pcd.all_sh = self.params["sh"]
-        self.pcd.all_scales = self.params["scales"]
-        self.pcd.all_quaternions = self.params["quats"]
-        opacities = self.params["opacities"]
-        self.pcd.all_alpha = opacities.unsqueeze(-1) if opacities.ndim == 1 else opacities
-        if self.strategy_state is not None:
-            for buf_name in _AUX_BUFFERS:
-                if buf_name in self.strategy_state:
-                    v = self.strategy_state[buf_name]
-                    if isinstance(v, torch.Tensor):
-                        setattr(self.pcd, buf_name, v)
+        with self.pcd.lock:
+            self.pcd.all_points = self.params["means"]
+            self.pcd.all_sh = self.params["sh"]
+            self.pcd.all_scales = self.params["scales"]
+            self.pcd.all_quaternions = self.params["quats"]
+            opacities = self.params["opacities"]
+            self.pcd.all_alpha = opacities.unsqueeze(-1) if opacities.ndim == 1 else opacities
+            if self.strategy_state is not None:
+                for buf_name in _AUX_BUFFERS:
+                    if buf_name in self.strategy_state:
+                        v = self.strategy_state[buf_name]
+                        if isinstance(v, torch.Tensor):
+                            setattr(self.pcd, buf_name, v)
 
     def training_step(self):
         if not self.step_limiter.allow(cost=1.0):
