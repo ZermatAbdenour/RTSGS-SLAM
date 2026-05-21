@@ -3,6 +3,7 @@ from __future__ import annotations
 import cv2
 import numpy as np
 import torch
+from gsplat.utils import depth_to_normal
 from pytorch3d.ops import knn_points
 
 from RTSGS.DataLoader.DataLoader import DataLoader
@@ -77,6 +78,34 @@ class ProjectedPointToPlaneTracker(Tracker):
         self._icp_fail_streak = 0
         self._icp_fail_print_every = 60
 
+        # --- Precomputed GPU tensors (optimisation 1) ---
+        self._depth_w, self._depth_h = config.get_depth_size()
+
+        # Source sample grid (subsampled, excluding 1-px border for neighbor access)
+        src_u = torch.arange(1, self._depth_w - 1, self.icp_stride, device=self.device)
+        src_v = torch.arange(1, self._depth_h - 1, self.icp_stride, device=self.device)
+        self._src_uu, self._src_vv = torch.meshgrid(src_u, src_v, indexing="xy")
+
+        # Normalised pixel coordinates for fast vertex map construction
+        full_u = torch.arange(0, self._depth_w, device=self.device, dtype=torch.float32)
+        full_v = torch.arange(0, self._depth_h, device=self.device, dtype=torch.float32)
+        full_uu, full_vv = torch.meshgrid(full_u, full_v, indexing="xy")
+        self._pixel_x = (full_uu - self.cx) / self.fx
+        self._pixel_y = (full_vv - self.cy) / self.fy
+
+        # Static matrices reused every ICP iteration
+        self._damping_eye6 = self.icp_damping * torch.eye(6, device=self.device, dtype=torch.float32)
+        self._eye3 = torch.eye(3, device=self.device, dtype=torch.float32)
+        self._eye4 = torch.eye(4, device=self.device, dtype=torch.float32)
+
+        # Intrinsics + identity cam2world for gsplat depth_to_normal (camera-space)
+        self._K_depth_t = torch.tensor([
+            [self.fx, 0.0, self.cx],
+            [0.0, self.fy, self.cy],
+            [0.0, 0.0, 1.0],
+        ], device=self.device, dtype=torch.float32)
+        self._identity_c2w = torch.eye(4, device=self.device, dtype=torch.float32)
+
     def track_frame(self, rgb, depth=None):
         if depth is None:
             self.prev_rgb = rgb
@@ -88,7 +117,8 @@ class ProjectedPointToPlaneTracker(Tracker):
         if self.prev_depth_m is None:
             self.prev_depth_m = depth_m
             self.prev_rgb = rgb
-            self.viz_img = self._make_tracking_debug_image(rgb, depth_m, depth_m, "init")
+            if self.show_matching_window:
+                self.viz_img = self._make_tracking_debug_image(rgb, depth_m, depth_m, "init")
             init_pose = self.poses[0].astype(np.float32)
             if self.dataset is not None:
                 self.dataset.rgb_keyframes.append(rgb)
@@ -123,13 +153,15 @@ class ProjectedPointToPlaneTracker(Tracker):
             ref_depth_m = self.prev_depth_m
 
         T_rel = self._point_to_plane_icp(ref_depth_m, depth_m, self.prev_rel_T)
-        self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
+
+        if self.show_matching_window:
+            self.viz_img = self._make_tracking_debug_image(rgb, ref_depth_m, depth_m, self.last_ref_depth_source)
+
         if T_rel is None:
             self._icp_fail_streak += 1
             if (self._icp_fail_streak % self._icp_fail_print_every) == 0:
                 valid_prev = int(np.count_nonzero((ref_depth_m > self.depth_min) & (ref_depth_m < self.depth_max) & np.isfinite(ref_depth_m)))
                 valid_cur = int(np.count_nonzero((depth_m > self.depth_min) & (depth_m < self.depth_max) & np.isfinite(depth_m)))
-                # Show raw depth stats (before scaling) to catch wrong depth_scale.
                 d_raw = np.asarray(depth, dtype=np.float32) if depth is not None else None
                 if d_raw is not None:
                     raw_min = float(np.nanmin(d_raw)) if d_raw.size else float("nan")
@@ -308,11 +340,11 @@ class ProjectedPointToPlaneTracker(Tracker):
 
         imgui.end()
 
+    @torch.no_grad()
     def _point_to_plane_icp(self, prev_depth_m: np.ndarray, cur_depth_m: np.ndarray, T_init: torch.Tensor):
         if self.icp_use_projective:
             return self._point_to_plane_icp_projective(prev_depth_m, cur_depth_m, T_init)
 
-        # Fallback to KNN-style correspondence path (kept for compatibility).
         src = self._depth_to_points(prev_depth_m, self.icp_stride)
         tgt_pts, tgt_nrm = self._depth_to_points_normals(cur_depth_m, self.icp_stride)
 
@@ -367,7 +399,7 @@ class ProjectedPointToPlaneTracker(Tracker):
             b = -r
 
             Aw = A * w[:, None]
-            H = Aw.T @ A + self.icp_damping * torch.eye(6, device=self.device, dtype=torch.float32)
+            H = Aw.T @ A + self._damping_eye6
             g = Aw.T @ b
 
             try:
@@ -396,26 +428,39 @@ class ProjectedPointToPlaneTracker(Tracker):
         self.last_icp_iterations = 0
         self.last_icp_rmse = 0.0
 
-        # Build source sample from previous depth (subsampled grid).
-        v = torch.arange(1, h - 1, self.icp_stride, device=self.device)
-        u = torch.arange(1, w - 1, self.icp_stride, device=self.device)
-        uu, vv = torch.meshgrid(u, v, indexing="xy")
-
-        z = prev_d[vv, uu]
+        # Source points from precomputed subsampled grid.
+        z = prev_d[self._src_vv, self._src_uu]
         valid = (z > self.depth_min) & (z < self.depth_max) & torch.isfinite(z)
         if torch.count_nonzero(valid).item() < self.icp_min_pairs:
             return None
 
-        uu = uu[valid].float()
-        vv = vv[valid].float()
+        uu = self._src_uu[valid].float()
+        vv = self._src_vv[valid].float()
         z = z[valid].float()
 
         x = (uu - self.cx) * z / self.fx
         y = (vv - self.cy) * z / self.fy
         src = torch.stack([x, y, z], dim=1)
 
-        # Build current-frame vertex and normal maps once.
-        vmap, nmap, valid_map = self._vertex_normal_maps(cur_d)
+        # Vertex map from precomputed normalised pixel coordinates.
+        vmap = torch.stack([self._pixel_x * cur_d, self._pixel_y * cur_d, cur_d], dim=2)
+
+        # Normal map via gsplat depth_to_normal (camera-space with identity cam2world).
+        nmap = depth_to_normal(
+            cur_d.unsqueeze(-1),
+            self._identity_c2w,
+            self._K_depth_t,
+            z_depth=True,
+        )
+
+        # Flip normals to face camera (negative z in camera space).
+        toward_camera = nmap[..., 2] > 0.0
+        nmap[toward_camera] = -nmap[toward_camera]
+
+        # Validity: good depth AND non-degenerate normal.
+        z_valid = (cur_d > self.depth_min) & (cur_d < self.depth_max) & torch.isfinite(cur_d)
+        n_valid = torch.linalg.norm(nmap, dim=2) > 1e-6
+        valid_map = z_valid & n_valid
 
         T = T_init.clone()
 
@@ -449,7 +494,6 @@ class ProjectedPointToPlaneTracker(Tracker):
             q = q[vm]
             n = n[vm]
 
-            # Reject pairs with large depth disagreement (projective outlier gate).
             if self.icp_proj_depth_max_diff > 0.0:
                 dz_mask = torch.abs(p[:, 2] - q[:, 2]) < self.icp_proj_depth_max_diff
                 if torch.count_nonzero(dz_mask).item() < self.icp_min_pairs:
@@ -480,7 +524,7 @@ class ProjectedPointToPlaneTracker(Tracker):
             b = -r
 
             Aw = A * w_huber[:, None]
-            H = Aw.T @ A + self.icp_damping * torch.eye(6, device=self.device, dtype=torch.float32)
+            H = Aw.T @ A + self._damping_eye6
             g = Aw.T @ b
 
             try:
@@ -498,39 +542,6 @@ class ProjectedPointToPlaneTracker(Tracker):
                 break
 
         return T
-
-    def _vertex_normal_maps(self, depth_t: torch.Tensor):
-        h, w = depth_t.shape
-
-        u = torch.arange(0, w, device=self.device, dtype=torch.float32)
-        v = torch.arange(0, h, device=self.device, dtype=torch.float32)
-        uu, vv = torch.meshgrid(u, v, indexing="xy")
-
-        z = depth_t
-        x = (uu - self.cx) * z / self.fx
-        y = (vv - self.cy) * z / self.fy
-        vmap = torch.stack([x, y, z], dim=2)
-
-        # Neighbor differences (valid only for interior pixels)
-        vx = vmap[1:-1, 2:, :] - vmap[1:-1, :-2, :]
-        vy = vmap[2:, 1:-1, :] - vmap[:-2, 1:-1, :]
-
-        n_inner = torch.cross(vx, vy, dim=2)
-        n_norm = torch.linalg.norm(n_inner, dim=2, keepdim=True)
-        n_inner = n_inner / torch.clamp(n_norm, min=1e-8)
-
-        nmap = torch.zeros((h, w, 3), device=self.device, dtype=torch.float32)
-        nmap[1:-1, 1:-1, :] = n_inner
-
-        # Keep normals facing camera.
-        toward_camera = nmap[..., 2] > 0.0
-        nmap[toward_camera] = -nmap[toward_camera]
-
-        z_valid = (z > self.depth_min) & (z < self.depth_max) & torch.isfinite(z)
-        n_valid = torch.isfinite(nmap).all(dim=2) & (torch.linalg.norm(nmap, dim=2) > 1e-6)
-        valid_map = z_valid & n_valid
-
-        return vmap, nmap, valid_map
 
     def _depth_to_points(self, depth_m: np.ndarray, stride: int):
         d = torch.from_numpy(depth_m).to(self.device)
@@ -629,8 +640,7 @@ class ProjectedPointToPlaneTracker(Tracker):
     @staticmethod
     def _huber_weight(r: torch.Tensor, delta: float):
         a = torch.abs(r)
-        ones = torch.ones_like(a)
-        return torch.where(a <= delta, ones, delta / (a + 1e-12))
+        return torch.where(a <= delta, torch.ones_like(a), delta / (a + 1e-12))
 
     @staticmethod
     def _transform_points(T: torch.Tensor, pts: torch.Tensor):
@@ -652,23 +662,22 @@ class ProjectedPointToPlaneTracker(Tracker):
         v = xi[3:]
         theta = torch.linalg.norm(w)
 
-        I = torch.eye(3, device=self.device, dtype=torch.float32)
         wx = self._skew(w)
 
         if theta.item() < 1e-8:
-            R = I + wx
-            V = I + 0.5 * wx
+            R = self._eye3 + wx
+            V = self._eye3 + 0.5 * wx
         else:
             theta2 = theta * theta
             A = torch.sin(theta) / theta
             B = (1.0 - torch.cos(theta)) / theta2
             C = (theta - torch.sin(theta)) / (theta2 * theta)
-            R = I + A * wx + B * (wx @ wx)
-            V = I + B * wx + C * (wx @ wx)
+            R = self._eye3 + A * wx + B * (wx @ wx)
+            V = self._eye3 + B * wx + C * (wx @ wx)
 
         t = V @ v
 
-        T = torch.eye(4, device=self.device, dtype=torch.float32)
+        T = self._eye4.clone()
         T[:3, :3] = R
         T[:3, 3] = t
         return T

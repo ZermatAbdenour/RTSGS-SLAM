@@ -5,6 +5,7 @@ import torch
 import torch.nn.functional as F
 from gsplat import rendering, spherical_harmonics
 from gsplat.strategy import DefaultStrategy
+from gsplat.strategy.ops import duplicate, split
 
 
 class TokenBucket:
@@ -47,6 +48,60 @@ def _build_K(fx: float, fy: float, cx: float, cy: float, device: torch.device) -
     K[0, 2] = cx
     K[1, 2] = cy
     return K
+
+
+class AbsoluteScaleStrategy(DefaultStrategy):
+    """DefaultStrategy with an absolute split threshold instead of scene_scale-relative.
+
+    In incremental SLAM the Gaussians are initialised with small, depth-dependent
+    scales.  The default ``grow_scale3d * scene_scale`` threshold grows with the
+    map and almost always exceeds the actual Gaussian sizes, so splitting never
+    fires.  This subclass replaces that check with a fixed world-space threshold.
+    """
+
+    split_scale_abs: float = 0.01
+
+    def __init__(self, split_scale_abs: float = 0.01, **kwargs):
+        super().__init__(**kwargs)
+        self.split_scale_abs = split_scale_abs
+
+    @torch.no_grad()
+    def _grow_gs(self, params, optimizers, state, step):
+        count = state["count"]
+        grads = state["grad2d"] / count.clamp_min(1)
+        device = grads.device
+
+        is_grad_high = grads > self.grow_grad2d
+        is_small = (
+            torch.exp(params["scales"]).max(dim=-1).values
+            <= self.split_scale_abs
+        )
+        is_dupli = is_grad_high & is_small
+        n_dupli = is_dupli.sum().item()
+
+        is_large = ~is_small
+        is_split = is_grad_high & is_large
+        if step < self.refine_scale2d_stop_iter:
+            if "radii" in state and state["radii"] is not None:
+                is_split = is_split | (state["radii"] > self.grow_scale2d)
+        n_split = is_split.sum().item()
+
+        if n_dupli > 0:
+            duplicate(params=params, optimizers=optimizers, state=state, mask=is_dupli)
+
+        is_split = torch.cat(
+            [is_split, torch.zeros(n_dupli, dtype=torch.bool, device=device)]
+        )
+
+        if n_split > 0:
+            split(
+                params=params,
+                optimizers=optimizers,
+                state=state,
+                mask=is_split,
+                revised_opacity=self.revised_opacity,
+            )
+        return n_dupli, n_split
 
 
 @torch.no_grad()
@@ -139,9 +194,9 @@ class GaussianSplatting:
         # Token-bucket limiter: smooth "max_steps_per_sec"
         self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=100.0)
 
-        # gsplat DefaultStrategy for densification and pruning
-        # Tuned for incremental SLAM: no opacity reset, continuous refinement
-        self.strategy = DefaultStrategy(
+        # Densification and pruning with absolute split threshold for SLAM.
+        self.strategy = AbsoluteScaleStrategy(
+            split_scale_abs=0.01,
             prune_opa=0.005,
             grow_grad2d=0.0002,
             grow_scale3d=0.01,
