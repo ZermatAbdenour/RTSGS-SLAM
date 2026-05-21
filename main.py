@@ -18,7 +18,7 @@ if __name__ == "__main__":
     config = load_config("configs/replica.yaml")
     print("Loading Data...")
 
-    data.load_data(1000)
+    data.load_data(30)
     print("Data Loaded.")
 
     tracker = ProjectedPointToPlaneTracker(dataset=data, config=config)

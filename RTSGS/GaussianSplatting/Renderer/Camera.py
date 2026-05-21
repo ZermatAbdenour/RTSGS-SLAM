@@ -59,7 +59,7 @@ class Camera():
     def get_up(self):
         return np.array([0, 1, 0], dtype=np.float32)
     
-    def process_mouse(self, mouse_x, mouse_y, delta_time):
+    def process_mouse(self, mouse_x, mouse_y):
         if self.first_mouse:
             self.last_mouse_x = mouse_x
             self.last_mouse_y = mouse_y
@@ -72,8 +72,8 @@ class Camera():
         self.last_mouse_x = mouse_x
         self.last_mouse_y = mouse_y
 
-        x_offset *= self.mouse_sensitivity * delta_time * 10
-        y_offset *= self.mouse_sensitivity * delta_time * 10
+        x_offset *= self.mouse_sensitivity
+        y_offset *= self.mouse_sensitivity
 
         pitch, yaw, roll = self.euler_angles
         yaw += np.radians(x_offset)
@@ -87,9 +87,8 @@ class Camera():
         forward = self.get_forward()
         self.position += forward * scroll_y * self.scroll_speed
     
-    def process_keyboard(self, keys, delta_time):
-        speed = self.sprint_speed if keys.get('SHIFT', False) else self.move_speed
-        velocity = speed * delta_time
+    def process_keyboard(self, keys):
+        velocity = self.sprint_speed if keys.get('SHIFT', False) else self.move_speed
         
         forward = self.get_forward()
         right = self.get_right()
@@ -164,7 +163,7 @@ class Camera():
         # Update projection matrix automatically when size changes
         self.projection = self.perspective(np.radians(self.fov), self.aspect_ratio, 0.02, 50.0)
 
-    def process_window_input(self, window_hovered: bool, window_focused: bool, delta_time: float):
+    def process_window_input(self, window_hovered: bool, window_focused: bool, delta_time: float = 0.0):
         io = imgui.get_io()
         
         # 1. Right-click to look logic
@@ -178,7 +177,7 @@ class Camera():
 
         if self.is_looking:
             mx, my = imgui.get_mouse_pos()
-            self.process_mouse(mx, my, delta_time)
+            self.process_mouse(mx, my)
 
         # 2. Scroll logic
         if window_hovered and io.mouse_wheel != 0:
@@ -196,4 +195,4 @@ class Camera():
                 'Q': glfw.get_key(win, glfw.KEY_Q) == glfw.PRESS,
                 'E': glfw.get_key(win, glfw.KEY_E) == glfw.PRESS,
                 'SHIFT': glfw.get_key(win, glfw.KEY_LEFT_SHIFT) == glfw.PRESS,}
-            self.process_keyboard(keys, delta_time)
+            self.process_keyboard(keys)
