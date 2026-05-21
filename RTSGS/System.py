@@ -79,6 +79,7 @@ class RTSGSSystem:
         # Benchmarking (enabled only when run(benchmark=True))
         self.benchmark: BenchmarkCollector | None = None
         self._trajectory_done = False
+        self.stop_training_on_trajectory_end = True
 
 
     def run(self, benchmark: bool = False):
@@ -122,8 +123,8 @@ class RTSGSSystem:
                     self.benchmark.mark_trajectory_ended()
             
             # 2. Run a training step (Optimization)
-            # This is now throttled internally by your max_steps_per_sec logic
-            self.gs.training_step()
+            if not (self.stop_training_on_trajectory_end and self._trajectory_done):
+                self.gs.training_step()
 
             # 3. Asynchronous Map Update
             # Drain as many pending keyframes as possible without waiting for the next GUI frame.
