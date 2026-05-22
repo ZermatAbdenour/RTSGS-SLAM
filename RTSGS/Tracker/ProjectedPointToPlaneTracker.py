@@ -159,9 +159,14 @@ class ProjectedPointToPlaneTracker(Tracker):
 
         if T_rel is None:
             self._icp_fail_streak += 1
+            valid_prev = int(np.count_nonzero((ref_depth_m > self.depth_min) & (ref_depth_m < self.depth_max) & np.isfinite(ref_depth_m)))
+            valid_cur = int(np.count_nonzero((depth_m > self.depth_min) & (depth_m < self.depth_max) & np.isfinite(depth_m)))
+
+            if valid_cur >= self.icp_min_pairs:
+                self.prev_depth_m = depth_m
+            self.prev_rgb = rgb
+
             if (self._icp_fail_streak % self._icp_fail_print_every) == 0:
-                valid_prev = int(np.count_nonzero((ref_depth_m > self.depth_min) & (ref_depth_m < self.depth_max) & np.isfinite(ref_depth_m)))
-                valid_cur = int(np.count_nonzero((depth_m > self.depth_min) & (depth_m < self.depth_max) & np.isfinite(depth_m)))
                 d_raw = np.asarray(depth, dtype=np.float32) if depth is not None else None
                 if d_raw is not None:
                     raw_min = float(np.nanmin(d_raw)) if d_raw.size else float("nan")
@@ -177,9 +182,6 @@ class ProjectedPointToPlaneTracker(Tracker):
                     f"valid_prev={valid_prev} valid_cur={valid_cur} "
                     f"depth_scale={self.depth_scale} raw_dtype={raw_dtype} raw_min={raw_min:.1f} raw_max={raw_max:.1f}"
                 )
-
-            self.prev_depth_m = depth_m
-            self.prev_rgb = rgb
             return None
 
         T_rel_np = T_rel.detach().cpu().numpy().astype(np.float32)
@@ -355,6 +357,7 @@ class ProjectedPointToPlaneTracker(Tracker):
         if src is None or tgt_pts is None or tgt_nrm is None:
             return None
         if src.shape[0] < self.icp_min_pairs or tgt_pts.shape[0] < self.icp_min_pairs:
+            self.last_icp_pairs = int(min(src.shape[0], tgt_pts.shape[0]))
             return None
 
         T = T_init.clone()
@@ -372,6 +375,7 @@ class ProjectedPointToPlaneTracker(Tracker):
             mask = d2 < (self.icp_corr_dist * self.icp_corr_dist)
             num_pairs = torch.count_nonzero(mask).item()
             if num_pairs < self.icp_min_pairs:
+                self.last_icp_pairs = int(num_pairs)
                 return None
 
             p = src_t[mask]
@@ -382,6 +386,7 @@ class ProjectedPointToPlaneTracker(Tracker):
             if self.icp_plane_residual_max > 0.0:
                 residual_mask = torch.abs(r) < self.icp_plane_residual_max
                 if torch.count_nonzero(residual_mask).item() < self.icp_min_pairs:
+                    self.last_icp_pairs = int(torch.count_nonzero(residual_mask).item())
                     return None
                 p = p[residual_mask]
                 q = q[residual_mask]
@@ -431,7 +436,9 @@ class ProjectedPointToPlaneTracker(Tracker):
         # Source points from precomputed subsampled grid.
         z = prev_d[self._src_vv, self._src_uu]
         valid = (z > self.depth_min) & (z < self.depth_max) & torch.isfinite(z)
-        if torch.count_nonzero(valid).item() < self.icp_min_pairs:
+        valid_count = torch.count_nonzero(valid).item()
+        if valid_count < self.icp_min_pairs:
+            self.last_icp_pairs = int(valid_count)
             return None
 
         uu = self._src_uu[valid].float()
@@ -477,7 +484,9 @@ class ProjectedPointToPlaneTracker(Tracker):
 
             in_bounds = (ui >= 1) & (ui < (w - 1)) & (vi >= 1) & (vi < (h - 1))
             mask = valid_z & in_bounds
-            if torch.count_nonzero(mask).item() < self.icp_min_pairs:
+            mask_count = torch.count_nonzero(mask).item()
+            if mask_count < self.icp_min_pairs:
+                self.last_icp_pairs = int(mask_count)
                 return None
 
             p = p[mask]
@@ -487,7 +496,9 @@ class ProjectedPointToPlaneTracker(Tracker):
             q = vmap[vi, ui]
             n = nmap[vi, ui]
             vm = valid_map[vi, ui]
-            if torch.count_nonzero(vm).item() < self.icp_min_pairs:
+            vm_count = torch.count_nonzero(vm).item()
+            if vm_count < self.icp_min_pairs:
+                self.last_icp_pairs = int(vm_count)
                 return None
 
             p = p[vm]
@@ -496,7 +507,9 @@ class ProjectedPointToPlaneTracker(Tracker):
 
             if self.icp_proj_depth_max_diff > 0.0:
                 dz_mask = torch.abs(p[:, 2] - q[:, 2]) < self.icp_proj_depth_max_diff
-                if torch.count_nonzero(dz_mask).item() < self.icp_min_pairs:
+                dz_count = torch.count_nonzero(dz_mask).item()
+                if dz_count < self.icp_min_pairs:
+                    self.last_icp_pairs = int(dz_count)
                     return None
                 p = p[dz_mask]
                 q = q[dz_mask]
@@ -505,7 +518,9 @@ class ProjectedPointToPlaneTracker(Tracker):
             r = torch.sum(n * (p - q), dim=1)
             if self.icp_plane_residual_max > 0.0:
                 residual_mask = torch.abs(r) < self.icp_plane_residual_max
-                if torch.count_nonzero(residual_mask).item() < self.icp_min_pairs:
+                residual_count = torch.count_nonzero(residual_mask).item()
+                if residual_count < self.icp_min_pairs:
+                    self.last_icp_pairs = int(residual_count)
                     return None
                 p = p[residual_mask]
                 q = q[residual_mask]

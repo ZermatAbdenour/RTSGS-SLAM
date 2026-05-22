@@ -4,9 +4,11 @@ from RTSGS.DataLoader.DataLoader import DataLoader
 import cv2
 
 class TUMDataLoader(DataLoader):
-    def __init__(self, rgb_path, depth_path=None, gt_path=None):
+    def __init__(self, rgb_path, depth_path=None, gt_path=None, fps=None):
+        rgb_path, depth_path = self._normalize_paths(rgb_path, depth_path)
         super().__init__(rgb_path, depth_path)
         self._gt_path = gt_path
+        self._fps = fps
 
         self.gt_timestamps = None
         self.gt_poses = None
@@ -40,6 +42,48 @@ class TUMDataLoader(DataLoader):
         return ts, vec
 
     @staticmethod
+    def _normalize_paths(rgb_path, depth_path):
+        if rgb_path is None:
+            return rgb_path, depth_path
+
+        # Allow passing the dataset root; auto-detect rgb/depth subfolders.
+        if depth_path is None:
+            rgb_candidate = os.path.join(rgb_path, "rgb")
+            depth_candidate = os.path.join(rgb_path, "depth")
+            if os.path.isdir(rgb_candidate) and os.path.isdir(depth_candidate):
+                return rgb_candidate, depth_candidate
+
+        if depth_path is None:
+            return rgb_path, depth_path
+
+        rgb_base = os.path.basename(os.path.normpath(rgb_path)).lower()
+        depth_base = os.path.basename(os.path.normpath(depth_path)).lower()
+        if rgb_base == "depth" and depth_base == "rgb":
+            print("[TUMDataLoader] Swapping rgb/depth paths based on folder names.")
+            return depth_path, rgb_path
+
+        return rgb_path, depth_path
+
+    @staticmethod
+    def _list_timestamped_images(folder_path):
+        if folder_path is None:
+            return []
+
+        files = []
+        for f in os.listdir(folder_path):
+            stem, ext = os.path.splitext(f)
+            if ext.lower() not in (".png", ".jpg", ".jpeg"):
+                continue
+            try:
+                float(stem)
+            except ValueError:
+                continue
+            files.append(f)
+
+        files.sort(key=lambda f: float(os.path.splitext(f)[0]))
+        return files
+
+    @staticmethod
     def _quat_xyzw_to_R(qx, qy, qz, qw):
         x, y, z, w = qx, qy, qz, qw
         xx, yy, zz = x * x, y * y, z * z
@@ -59,11 +103,28 @@ class TUMDataLoader(DataLoader):
         return T
 
     def load_data(self, limit=-1, max_dt=0.02):
-        # Sort files numerically by timestamp, not lexicographically!
-        rgb_files = sorted(os.listdir(self._rgb_path), key=lambda f: float(f[:-4]))
-        depth_files = sorted(os.listdir(self._depth_path), key=lambda f: float(f[:-4]))
-        rgb_ts = np.array([float(f[:-4]) for f in rgb_files], dtype=np.float64)
-        depth_ts = np.array([float(f[:-4]) for f in depth_files], dtype=np.float64)
+        # Reset streaming state for repeated runs.
+        self.RGBD_pairs = []
+        self.time_stamps = []
+        self.current_frame_index = 0
+        self.current_keyframe_index = 0
+        self._served_last_frame = False
+        self._stream_start_time = -1
+        self.rgb_keyframes = []
+        self.depth_keyframes = []
+
+        # Sort files numerically by timestamp, not lexicographically.
+        rgb_files = self._list_timestamped_images(self._rgb_path)
+        depth_files = self._list_timestamped_images(self._depth_path)
+        if not rgb_files or not depth_files:
+            print("Error: No RGB or Depth files found!")
+            self.gt_timestamps = None
+            self.gt_vec = None
+            self.gt_poses = None
+            return
+
+        rgb_ts = np.array([float(os.path.splitext(f)[0]) for f in rgb_files], dtype=np.float64)
+        depth_ts = np.array([float(os.path.splitext(f)[0]) for f in depth_files], dtype=np.float64)
         gt_ts, gt_vec = self._load_tum_gt_file(self._gt_path)
 
         pairs = []
@@ -112,7 +173,11 @@ class TUMDataLoader(DataLoader):
 
         # Store results
         self.RGBD_pairs = pairs
-        self.time_stamps = np.asarray(used_rgb_ts, dtype=np.float64)
+        if self._fps is not None and self._fps > 0:
+            dt = 1.0 / float(self._fps)
+            self.time_stamps = np.arange(len(pairs), dtype=np.float64) * dt
+        else:
+            self.time_stamps = np.asarray(used_rgb_ts, dtype=np.float64)
         if gt_ts is not None:
             self.gt_timestamps = np.asarray(used_gt_ts, dtype=np.float64)
             self.gt_vec = np.asarray(used_gt_vec, dtype=np.float32)

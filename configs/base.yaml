@@ -32,7 +32,7 @@ gaussian_splatting:
   alpha_depth_scale: 0.0
   points_lr_mult: 0.3
   depth_loss_weight: 0.1
-  depth_huber_delta: 0.05
+  depth_huber_delta: 0.001
   pack_offset: 1000000
   pixel_subsample: 1.0
 
@@ -104,7 +104,7 @@ scenegraph:
   update_stride: 10
   max_nodes: 48
   max_relations: 256
-  rel_threshold: 0.2
+  rel_threshold: 0.5
   instance_ttl: 30
   instance_merge_dist: 0.6
   ema_momentum: 0.3

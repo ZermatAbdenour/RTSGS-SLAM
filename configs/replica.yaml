@@ -28,7 +28,7 @@ gaussian_splatting:
   alpha_max: 1.0
   alpha_depth_scale: 0.0
   points_lr_mult: 0.3
-  depth_loss_weight: 0.1
+  depth_loss_weight: 0.001
   depth_huber_delta: 0.05
 
 tracker:
