@@ -27,9 +27,9 @@ gaussian_splatting:
   alpha_min: 0.01
   alpha_max: 1.0
   alpha_depth_scale: 0.0
+  depth_edge_threshold_m: 0.0
   points_lr_mult: 0.3
-  depth_loss_weight: 0.001
-  depth_huber_delta: 0.05
+  depth_loss_weight: 1
 
 tracker:
   use_rendered_depth_icp: true

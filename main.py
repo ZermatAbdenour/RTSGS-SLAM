@@ -12,8 +12,8 @@ if __name__ == "__main__":
     if torch.cuda.is_available():
         torch.cuda.init()
 
-    data_path = "./Datasets/Replica/ThirdParty/Replica/office3/results"
-    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/office3/traj.txt"
+    data_path = "./Datasets/Replica/ThirdParty/Replica/room1/results"
+    trajectory_path = "./Datasets/Replica/ThirdParty/Replica/room1/traj.txt"
     #rgb_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household/rgb"
     #depth_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household/depth"
     #trajectory_path = "./Datasets/rgbd_dataset_freiburg3_long_office_household/groundtruth.txt"
@@ -24,7 +24,7 @@ if __name__ == "__main__":
     config = load_config("configs/replica.yaml")
     print("Loading Data...")
 
-    data.load_data(600)
+    data.load_data(1000)
     print("Data Loaded.")
 
     tracker = ProjectedPointToPlaneTracker(dataset=data, config=config)

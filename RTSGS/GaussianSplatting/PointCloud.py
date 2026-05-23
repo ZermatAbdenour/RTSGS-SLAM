@@ -47,6 +47,10 @@ class PointCloud:
         self.alpha_max = float(gs.alpha_max)
         self.alpha_depth_scale = float(gs.alpha_depth_scale)
 
+        self.depth_min = float(gs.depth_min)
+        self.depth_max = float(gs.depth_max)
+        self.depth_edge_threshold_m = float(gs.depth_edge_threshold_m)
+
         self.all_points = None
         self.all_sh = None
         self.all_scales = None
@@ -165,6 +169,16 @@ class PointCloud:
         return points[first_idx[is_new]], colors[first_idx[is_new]], first_idx[is_new]
 
     @torch.no_grad()
+    def rebuild_seen_keys(self):
+        """Recompute voxel occupancy from surviving Gaussians so pruned regions can be re-populated."""
+        if self.all_points is None or self.all_points.shape[0] == 0:
+            self.seen_keys = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return
+        vox = torch.floor(self.all_points / self.novelty_voxel).to(torch.int64)
+        keys = self._pack_voxels(vox)
+        self.seen_keys = torch.unique(keys)
+
+    @torch.no_grad()
     def voxel_filter_with_gaussians(self, points, sh, scales, quats, alpha, voxel):
         if points.numel() == 0: return points, sh, scales, quats, alpha
         vox = torch.floor(points / voxel).to(torch.int64)
@@ -193,6 +207,20 @@ class PointCloud:
 
         H_d, W_d = depth.shape
         H_r, W_r = rgb.shape[:2]
+
+        valid_depth = (depth > self.depth_min) & (depth < self.depth_max) & torch.isfinite(depth)
+
+        if self.depth_edge_threshold_m > 0.0 and H_d >= 3 and W_d >= 3:
+            padded = F.pad(depth.unsqueeze(0).unsqueeze(0), (1, 1, 1, 1), mode='replicate')[0, 0]
+            max_neighbor_diff = torch.stack([
+                torch.abs(depth - padded[:-2, 1:-1]),
+                torch.abs(depth - padded[2:, 1:-1]),
+                torch.abs(depth - padded[1:-1, :-2]),
+                torch.abs(depth - padded[1:-1, 2:]),
+            ]).max(dim=0).values
+            valid_depth &= max_neighbor_diff < self.depth_edge_threshold_m
+
+        depth = torch.where(valid_depth, depth, torch.zeros_like(depth))
         z_raw = depth.reshape(-1)
         mask = z_raw > 0
 

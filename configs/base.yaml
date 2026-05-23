@@ -26,14 +26,16 @@ gaussian_splatting:
   sigma_px: 4.0
   sigma_z0: 0.005
   sigma_z1: 0.0
-  alpha_init: 1.0
+  alpha_init: 0.5
   alpha_min: 0.01
-  alpha_max: 1.0
+  alpha_max: 0.98
   alpha_depth_scale: 0.0
   points_lr_mult: 0.3
-  depth_loss_weight: 0.1
-  depth_huber_delta: 0.001
+  depth_loss_weight: 0.5
   pack_offset: 1000000
+  depth_min: 0.10
+  depth_max: 8.0
+  depth_edge_threshold_m: 0.03
   pixel_subsample: 1.0
 
 # ── Tracker ───────────────────────────────────────────────────────────────────

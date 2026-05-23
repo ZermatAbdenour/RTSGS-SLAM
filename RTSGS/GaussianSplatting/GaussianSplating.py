@@ -60,10 +60,12 @@ class AbsoluteScaleStrategy(DefaultStrategy):
     """
 
     split_scale_abs: float = 0.01
+    grow_min_opa: float = 0.5
 
-    def __init__(self, split_scale_abs: float = 0.01, **kwargs):
+    def __init__(self, split_scale_abs: float = 0.01, grow_min_opa: float = 0.5, **kwargs):
         super().__init__(**kwargs)
         self.split_scale_abs = split_scale_abs
+        self.grow_min_opa = grow_min_opa
 
     @torch.no_grad()
     def _grow_gs(self, params, optimizers, state, step):
@@ -72,6 +74,8 @@ class AbsoluteScaleStrategy(DefaultStrategy):
         device = grads.device
 
         is_grad_high = grads > self.grow_grad2d
+        is_confident = torch.sigmoid(params["opacities"]) >= self.grow_min_opa
+        is_grad_high = is_grad_high & is_confident
         is_small = (
             torch.exp(params["scales"]).max(dim=-1).values
             <= self.split_scale_abs
@@ -190,7 +194,6 @@ class GaussianSplatting:
         gs = self.tracker.config.gaussian_splatting
         self.points_lr_mult = float(gs.points_lr_mult)
         self.depth_loss_weight = float(gs.depth_loss_weight)
-        self.depth_huber_delta = float(gs.depth_huber_delta)
 
         # Token-bucket limiter: smooth "max_steps_per_sec"
         self.step_limiter = TokenBucket(rate=max_steps_per_sec, burst=100.0)
@@ -198,7 +201,7 @@ class GaussianSplatting:
         # Densification and pruning with absolute split threshold for SLAM.
         self.strategy = AbsoluteScaleStrategy(
             split_scale_abs=0.01,
-            prune_opa=0.005,
+            prune_opa=0.02,
             grow_grad2d=0.0002,
             grow_scale3d=0.01,
             grow_scale2d=0.05,
@@ -206,7 +209,7 @@ class GaussianSplatting:
             prune_scale2d=0.15,
             refine_start_iter=100,
             refine_stop_iter=10_000_000,
-            reset_every=10_000_000,
+            reset_every=3000,
             refine_every=100,
             absgrad=False,
             verbose=True,
@@ -878,18 +881,26 @@ class GaussianSplatting:
         rendered_rgb = rendered[..., :3]
         rendered_depth = rendered[..., 3] if rendered.shape[-1] > 3 else None
 
-        l1_loss = F.l1_loss(rendered_rgb, gt_rgbs)
-        rgb_loss = l1_loss
+        if gt_depths is not None:
+            valid = (gt_depths > 0.0) & torch.isfinite(gt_depths)
+            rgb_mask = valid.unsqueeze(-1).expand_as(rendered_rgb)
+            if rgb_mask.any():
+                rgb_loss = F.l1_loss(rendered_rgb[rgb_mask], gt_rgbs[rgb_mask])
+            else:
+                rgb_loss = F.l1_loss(rendered_rgb, gt_rgbs)
 
-        depth_loss = torch.zeros((), device=self.device)
-        if gt_depths is not None and rendered_depth is not None:
-            valid = (gt_depths > 0.0) & torch.isfinite(gt_depths) & torch.isfinite(rendered_depth) & (rendered_depth > 0.0)
-            if valid.any():
-                depth_loss = F.smooth_l1_loss(
-                    rendered_depth[valid],
-                    gt_depths[valid],
-                    beta=self.depth_huber_delta,
-                )
+            depth_loss = torch.zeros((), device=self.device)
+            if rendered_depth is not None:
+                dvalid = valid & torch.isfinite(rendered_depth) & (rendered_depth > 0.0)
+                if dvalid.any():
+                    rd = rendered_depth[dvalid]
+                    gd = gt_depths[dvalid]
+                    per_pixel = F.l1_loss(rd, gd, reduction='none')
+                    w = 1.0 / (gd * gd).clamp(min=0.01)
+                    depth_loss = (per_pixel * w).sum() / w.sum()
+        else:
+            rgb_loss = F.l1_loss(rendered_rgb, gt_rgbs)
+            depth_loss = torch.zeros((), device=self.device)
 
         total_loss = rgb_loss + self.depth_loss_weight * depth_loss
 
@@ -913,6 +924,7 @@ class GaussianSplatting:
             if means_before is not self.params["means"]:
                 self._sync_pcd_from_params()
                 self.num_points_optimized = self.params["means"].shape[0]
+                self.pcd.rebuild_seen_keys()
 
             now = time.time()
             self._step_timestamps.append(now)
